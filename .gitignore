@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local runtime artifacts — regenerable, see README quick start:
+#   search.json       -> `python3 -m cli init` seeds it from search.json.example
+#   test-search.db    -> `python3 -m cli index`
+#   data/             -> `python3 make_test_data.py data`
+search.json
+test-search.db
+search.db
+*.db-journal
+*.db-wal
+*.db-shm
+data/

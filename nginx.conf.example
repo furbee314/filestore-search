@@ -1,0 +1,40 @@
+# /etc/nginx/conf.d/filestore-search.conf
+#
+# Serves the search UI + API (proxying to the local Python app) AND the
+# actual file downloads from your file store (/mnt here).
+#
+# If your file store is ALREADY served by nginx today, you can instead keep
+# that location and point "Download" links at it by setting "public_url" in
+# search.json (or FILESTORE_SEARCH_URL) to its base URL, and skipping the
+# /files/ location below.
+
+upstream filestore_search {
+    server 127.0.0.1:8080;
+    keepalive 16;
+}
+
+server {
+    listen 80;
+    server_name files.example.com;
+    # or: ssl_certificate /etc/letsencrypt/live/files.example.com/fullchain.pem;
+    #     ssl_certificate_key /etc/letsencrypt/live/files.example.com/privkey.pem;
+    #     listen 443 ssl;
+
+    # --- search UI + JSON API (local app) ---
+    location / {
+        proxy_pass http://filestore_search;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        # AI-answer requests can wait on the LLM for up to ~40s
+        proxy_read_timeout 90s;
+    }
+
+    # --- file downloads straight from the file store ---
+    # /files/repos/RHEL9/... -> /mnt/repos/RHEL9/...
+    location /files/ {
+        alias /mnt/;
+        add_header Content-Disposition 'attachment';
+        # nginx supports Range requests natively (resumable big ISOs)
+        autoindex off;
+    }
+}
