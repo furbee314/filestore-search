@@ -48,6 +48,8 @@ Zero third-party Python dependencies (stdlib only).
 | `make_test_data.py` | generates a synthetic vendor-named store for testing |
 | `mock_llm.py` | mock OpenAI-compatible LLM for testing without a real one |
 | `requirements.txt` | documents Python dependencies (none — stdlib only) + host-level LLM deps |
+| `prepare-offline-ollama.sh` | build an air-gapped Ollama+model transfer bundle (run on a connected machine) |
+| `offline-install-ollama.sh` | install Ollama + model on the offline system from that bundle |
 | `test_e2e.py`, `test_download.py`, `test_robust.py` | end-to-end + robustness test scripts |
 
 ## Local LLM on CPU (default: Ollama + qwen2.5:3b-instruct)
@@ -108,6 +110,55 @@ Practical notes:
   `llm_model` (e.g. vLLM or llama.cpp `server` on port 8000). The
   `num_ctx` hint is only sent to Ollama (detected by port 11434); other
   backends are left untouched.
+
+## Offline (air-gapped) deployment
+
+If the destination system has no network access at all, use the two
+helper scripts shipped in this repo to transfer everything in one bundle:
+
+1. **On a connected machine of the same architecture** (amd64 here), build
+   the transfer bundle:
+   ```bash
+   ./prepare-offline-ollama.sh /path/to/out
+   # -> /path/to/out/filestore-search-offline-llm.tar
+   #    (Ollama linux tarball + sha256 + the qwen2.5:3b-instruct model
+   #     library in Ollama's ready-to-use on-disk layout, ~3.3GB total)
+   ```
+   Pass a zstd .rpm as a 4th argument (e.g.
+   `dnf download zstd` then
+   `./prepare-offline-ollama.sh /out v0.32.14 qwen2.5:3b-instruct zstd-*.rpm`)
+   to pack it into the bundle — the install script will `rpm -ivh` it
+   automatically if the target lacks zstd.
+   The script pins the Ollama version (default `v0.32.14`, change via its
+   2nd argument) so the bundle matches `offline-install-ollama.sh`.
+2. **Copy to the offline system** (any medium — USB, `scp` over a jump
+   host, CD). You need three things:
+   - `filestore-search-offline-llm.tar` (the bundle)
+   - `offline-install-ollama.sh`
+   - the `filestore-search` source tree (this repo — `git archive` works)
+   Plus the `zstd` package on the target: `dnf install zstd` works from
+   the OS installation media, or `rpm -ivh` the zstd .rpm.
+3. **On the offline system** (as root):
+   ```bash
+   ./offline-install-ollama.sh /path/to/filestore-search-offline-llm.tar
+   ```
+   The script verifies the tarball checksum, unpacks Ollama to `/usr/local`,
+   creates the `ollama` user, installs `ollama.service` (same unit as the
+   one in this repo), restores the model library to
+   `/usr/share/ollama/.ollama/models` with correct ownership, then starts
+   the service and checks `ollama list` shows `qwen2.5:3b-instruct`.
+4. **Deploy the app** exactly as in "Production deployment" (index, systemd
+   unit for the app, nginx) — nothing else on the app side is network
+   dependent: it talks only to SQLite and `127.0.0.1:11434`.
+5. **Smoke test**: `python3 -m cli llm-test` and a search through the UI;
+   the first request warms up the model (30-60s, expected).
+
+Manual alternative (no helper scripts): download
+`https://github.com/ollama/ollama/releases/download/<ver>/ollama-linux-amd64.tar.zst`
+on the connected box, `zstd -d` + `tar -x` into `/usr/local` on the target,
+and copy `/usr/share/ollama/.ollama/models/` (blobs + manifests) to the
+same path on the target with `ollama:ollama` ownership — the install script
+is that sequence with checksums and user/systemd setup added.
 
 ## Quick start (dev/test on this machine)
 

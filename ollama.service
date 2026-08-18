@@ -19,6 +19,8 @@ Description=Ollama LLM server (local, CPU)
 After=network.target
 
 [Service]
+User=ollama
+Group=ollama
 Type=simple
 Environment=OLLAMA_HOST=127.0.0.1:11434
 Environment=OLLAMA_CONTEXT_LENGTH=4096
@@ -31,6 +33,8 @@ RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
+# Ollama keeps its model library under /usr/share/ollama/.ollama
+ReadWritePaths=/usr/share/ollama
 
 [Install]
 WantedBy=multi-user.target

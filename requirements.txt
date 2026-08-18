@@ -3,10 +3,18 @@
 # Nothing to install here — `pip install -r requirements.txt` is a no-op.
 #
 # Host-level dependencies for the local CPU LLM (system packages, not Python
-# packages — see README "Local LLM on CPU"):
+# packages — see README "Local LLM on CPU" and "Offline (air-gapped)
+# deployment"):
 #   - Ollama:
 #       curl -fsSL https://ollama.com/install.sh | sh
 #     The installer may need the system package `zstd` to unpack its tarball
 #     (e.g. `dnf install zstd` on RHEL 9 / `apt-get install zstd` on Debian).
 #   - Model:
 #       ollama pull qwen2.5:3b-instruct   # ~2.3GB, Q4_K_M, CPU-friendly
+#   - AIR-GAPPED SYSTEMS (no network): do NOT use the commands above on the
+#     target. Instead:
+#       connected box:  ./prepare-offline-ollama.sh /out   # -> ~3.3GB tar
+#                       (+ optionally: dnf download zstd, to carry the .rpm)
+#       target box:     ./offline-install-ollama.sh /out/filestore-search-offline-llm.tar
+#     The bundle already contains the Ollama binary and the model; the only
+#     OS package the target still needs is zstd (from OS install media).
