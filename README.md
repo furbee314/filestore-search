@@ -3,8 +3,9 @@
 Natural-language search over a file store of vendor-named software: Red Hat
 (RPM), Ubuntu/Debian (deb), Windows (MSI/EXE), firmware and drivers. Runs
 fully offline: SQLite FTS5 for the fast deterministic layer, plus an
-optional local LLM (any OpenAI-compatible endpoint: Ollama, vLLM,
-llama.cpp server, text-generation-webui, LM Studio...) for turning
+optional local LLM — by default Ollama on the same machine, **CPU-only,
+no GPU needed** (any OpenAI-compatible endpoint also works: vLLM,
+llama.cpp server, text-generation-webui, LM Studio...) — for turning
 "firmware for my Dell R740" into a precise query and for answering
 questions in plain English.
 
@@ -40,12 +41,68 @@ Zero third-party Python dependencies (stdlib only).
 | `app.py` | web UI + JSON API + `/files/` downloads (ThreadingHTTPServer) |
 | `cli.py` | `init / index / refresh / search / llm-test / stats / serve` |
 | `filestore-search.service` | systemd unit for the web app |
+| `ollama.service` | systemd unit for Ollama (local LLM, CPU) |
 | `reindex.sh` | wrapper for cron/systemd-timer refresh |
 | `search.json.example` | example configuration (copy to `search.json`) |
 | `nginx.conf.example` | nginx vhost: proxy UI+API, alias `/files/` to your store |
 | `make_test_data.py` | generates a synthetic vendor-named store for testing |
 | `mock_llm.py` | mock OpenAI-compatible LLM for testing without a real one |
 | `test_e2e.py`, `test_download.py`, `test_robust.py` | end-to-end + robustness test scripts |
+
+## Local LLM on CPU (default: Ollama + qwen2.5:3b-instruct)
+
+The target deployment is a CPU-only box (this app is tested on an 8-core
+Ryzen 7 / 9.5GB RAM host, no GPU). The default configuration therefore
+points at a local Ollama server with a small instruct model:
+
+1. **Install Ollama** (no GPU required; it simply runs on the CPU):
+   ```bash
+   curl -fsSL https://ollama.com/install.sh | sh
+   ```
+2. **Pull the model** (Q4_K_M 4-bit; ~2.3GB download, ~2.6GB RAM resident):
+   ```bash
+   ollama pull qwen2.5:3b-instruct
+   ```
+3. **Run it** — either `systemctl enable --now ollama` (a ready-made,
+   CPU-friendly unit is shipped as `ollama.service`: binds to 127.0.0.1,
+   4096-token context, capped at ~6 CPU cores so the search app still gets
+   cycles) or `ollama serve` / `systemctl enable ollama` (the installer's
+   stock unit).
+4. **Point the app at it.** The defaults already do this:
+   `llm_base = http://127.0.0.1:11434/v1`,
+   `llm_model = qwen2.5:3b-instruct`. Nothing else to configure.
+
+Sizing guide (RAM budget for the model):
+
+| model | RAM (weights + ctx) | feel on an 8-core CPU | use when |
+|---|---|---|---|
+| qwen2.5:1.5b-instruct | ~2GB | ~10-15 tok/s | RAM < 4GB, rewrite-only duty |
+| **qwen2.5:3b-instruct (default)** | **~3GB** | **~5-10 tok/s** | **the sweet spot for this app** |
+| qwen2.5:7b-instruct | ~6GB | ~2-4 tok/s | 8GB+ RAM and you want better prose answers |
+
+Practical notes:
+
+- **Context window is the main RAM dial.** The app sends
+  `options.num_ctx = llm_max_ctx` (default 4096) to Ollama on every
+  request. On a tight box set `llm_max_ctx` to 2048 (env
+  `FILESTORE_SEARCH_LLM_MAX_CTX`) and cut `OLLAMA_CONTEXT_LENGTH` too.
+  This app's prompts (rewrite ~300 tokens, answer ~900 tokens) fit in
+  2048 with headroom.
+- **Timeouts.** CPU inference is slow: the app's default LLM timeout is
+  60s (rewrite budget 45s, answer budget 90s). Raise
+  `llm_timeout` / `FILESTORE_SEARCH_LLM_TIMEOUT` on weaker CPUs; the app
+  still degrades gracefully to plain FTS if a call times out, so a slow
+  answer just means "no AI answer this time", never a broken search.
+- **First request warms up** (model load + JIT): the very first call can
+  take 30-60s. Subsequent calls are fast because Ollama keeps the model
+  resident (idle eviction after 5 min by default).
+- **CPU contention.** One request at a time is the intended use (a
+  single UI / a few admins). If you need parallel search+answer, bump
+  `OLLAMA_NUM_PARALLEL` and expect per-request latency to climb.
+- **Any other OpenAI-compatible server works** — just set `llm_base` /
+  `llm_model` (e.g. vLLM or llama.cpp `server` on port 8000). The
+  `num_ctx` hint is only sent to Ollama (detected by port 11434); other
+  backends are left untouched.
 
 ## Quick start (dev/test on this machine)
 
@@ -56,13 +113,16 @@ export FILESTORE_SEARCH_DATA=$(pwd)/data \
 python3 make_test_data.py data      # 51 synthetic vendor-named files
 python3 -m cli init
 python3 -m cli index                # full index
-python3 mock_llm.py --port 8901 &   # optional: mock LLM
-export FILESTORE_SEARCH_LLM_BASE=http://127.0.0.1:8901/v1 \
-       FILESTORE_SEARCH_LLM_MODEL=mock
+ollama pull qwen2.5:3b-instruct     # once, ~2.3GB
+ollama serve &                      # or: systemctl start ollama
+# defaults already target Ollama on 127.0.0.1:11434 + qwen2.5:3b-instruct
 python3 -m app --port 8099          # the test scripts expect port 8099
 # open http://localhost:8099  ->  "firmware for my Dell R740"
-python3 -m cli llm-test            # verify LLM connectivity
+python3 -m cli llm-test             # verify LLM connectivity
 python3 test_e2e.py && python3 test_download.py && python3 test_robust.py
+# (no Ollama handy? mock_llm.py stands in for it:
+#   python3 mock_llm.py --port 8901 &
+#   export FILESTORE_SEARCH_LLM_BASE=http://127.0.0.1:8901/v1 FILESTORE_SEARCH_LLM_MODEL=mock
 ```
 
 ## Production deployment
@@ -76,10 +136,11 @@ python3 test_e2e.py && python3 test_download.py && python3 test_robust.py
    | `data_dir` | `FILESTORE_SEARCH_DATA` | root of the file store. Everything under it is indexed and served by relative path. For this box: `/mnt` (with `Software_Library/`, `repos/`, `isos/` inside). |
    | `db_path` | `FILESTORE_SEARCH_DB` | where the SQLite index lives. Needs a writable dir for the user running the app. |
    | `public_url` | `FILESTORE_SEARCH_URL` | base URL the UI puts on download links. If your nginx already serves the store, set this to it (e.g. `https://files.example.com`) and the app's own `/files/` endpoint is unused. Leave `""` to download through the app (`/files/...`). |
-   | `llm_base` | `FILESTORE_SEARCH_LLM_BASE` | OpenAI-compatible base of your local LLM, i.e. up to and including `/v1`. Ollama: `http://127.0.0.1:11434/v1`. vLLM / llama.cpp server: `http://<host>:8000/v1`. text-generation-webui: its OpenAI-compatible URL. |
-   | `llm_model` | `FILESTORE_SEARCH_LLM_MODEL` | model name the endpoint expects (Ollama tag, vLLM `--served-model-name`, etc.). |
+   | `llm_base` | `FILESTORE_SEARCH_LLM_BASE` | OpenAI-compatible base of your local LLM, i.e. up to and including `/v1`. Default (CPU box): Ollama on the same host, `http://127.0.0.1:11434/v1`. vLLM / llama.cpp server: `http://<host>:8000/v1`. text-generation-webui: its OpenAI-compatible URL. |
+   | `llm_model` | `FILESTORE_SEARCH_LLM_MODEL` | model name the endpoint expects. Default: `qwen2.5:3b-instruct` (small instruct model, runs on CPU; Ollama tag or vLLM `--served-model-name`). |
    | `llm_api_key` | `FILESTORE_SEARCH_LLM_API_KEY` | optional. Most local servers need none (leave `""`); text-generation-webui does. |
-   | `llm_timeout` | `FILESTORE_SEARCH_LLM_TIMEOUT` | seconds per LLM call. Bump for small models on slow hardware. |
+   | `llm_timeout` | `FILESTORE_SEARCH_LLM_TIMEOUT` | seconds per LLM call. Default 60 — CPU inference is slow; bump further on weak CPUs. |
+   | `llm_max_ctx` | `FILESTORE_SEARCH_LLM_MAX_CTX` | context window (tokens) sent to Ollama as `options.num_ctx`; default 4096. Lower it (2048) on RAM-tight boxes. |
    | `llm_disable` | `FILESTORE_SEARCH_LLM_DISABLE` | `true` = pure FTS mode, no LLM calls at all. |
    | `max_results` | `FILESTORE_SEARCH_MAX_RESULTS` | cap on results returned per search. |
    | `ignored_names` | — | filename prefixes to skip while indexing. |
@@ -91,10 +152,11 @@ python3 test_e2e.py && python3 test_download.py && python3 test_robust.py
      "data_dir": "/mnt",
      "db_path": "/var/lib/filestore-search/search.db",
      "public_url": "https://files.example.com",
-     "llm_base": "http://127.0.0.1:8000/v1",
-     "llm_model": "qwen2.5-7b-instruct",
+     "llm_base": "http://127.0.0.1:11434/v1",
+     "llm_model": "qwen2.5:3b-instruct",
      "llm_api_key": "",
-     "llm_timeout": 30,
+     "llm_timeout": 60,
+     "llm_max_ctx": 4096,
      "llm_disable": false,
      "max_results": 25,
      "ignored_names": [".", "~$", ".tmp", ".swp", "Thumbs.db", ".DS_Store"]
@@ -121,12 +183,14 @@ python3 test_e2e.py && python3 test_download.py && python3 test_robust.py
    by nginx, just set `public_url` to its base URL and drop the `/files/`
    location.
 6. **LLM** (optional but recommended): point `llm_base` at your local
-   OpenAI-compatible service. With a smaller model, enable the "AI answer"
-   checkbox only when you want prose answers; the search itself works with
-   or without the LLM (it rewrites the query and adds category/platform
-   filters; if that over-filters, the app automatically retries without the
-   filters). If the LLM is down or disabled, everything still works via
-   plain FTS.
+   OpenAI-compatible service — on this CPU-only box the default is Ollama
+   with `qwen2.5:3b-instruct` (see "Local LLM on CPU" above; install Ollama
+   + `ollama pull` + `systemctl enable --now ollama`, done). With a smaller
+   model, enable the "AI answer" checkbox only when you want prose answers;
+   the search itself works with or without the LLM (it rewrites the query
+   and adds category/platform filters; if that over-filters, the app
+   automatically retries without the filters). If the LLM is down or
+   disabled, everything still works via plain FTS.
 
 ## How search works
 

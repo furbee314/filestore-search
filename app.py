@@ -81,7 +81,7 @@ def do_search(q, category=None, platform=None, limit=25, want_answer=False,
 
     if llm.enabled:
         try:
-            rr = llm.rewrite_query(q, timeout=20)
+            rr = llm.rewrite_query(q, timeout=min(45, llm.timeout))
             if rr:
                 query = rr["query"] or q
                 cat = rr["category"] or cat
@@ -155,7 +155,7 @@ def do_search(q, category=None, platform=None, limit=25, want_answer=False,
             answer = None
         else:
             try:
-                answer = llm.answer(q, results, timeout=40)
+                answer = llm.answer(q, results, timeout=min(90, llm.timeout))
             except Exception as e:
                 answer = f"(LLM unavailable: {e})"
 

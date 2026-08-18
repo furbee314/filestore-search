@@ -9,9 +9,14 @@ Key environment variables:
   FILESTORE_SEARCH_DATA     directory of files to index (default: $ROOT/data)
   FILESTORE_SEARCH_DB       path to SQLite db (default: $ROOT/search.db)
   FILESTORE_SEARCH_URL      public base URL the web UI uses to build download links
-  FILESTORE_SEARCH_LLM_BASE base URL of the local LLM (OpenAI-compatible /v1/chat/completions)
-  FILESTORE_SEARCH_LLM_MODEL model name to request (e.g. qwen2.5-7b-instruct)
-  FILESTORE_SEARCH_LLM_TIMEOUT seconds, default 30
+  FILESTORE_SEARCH_LLM_BASE base URL of the local LLM (OpenAI-compatible /v1/chat/completions).
+                            Default: Ollama on this machine (CPU), http://127.0.0.1:11434/v1
+  FILESTORE_SEARCH_LLM_MODEL model name to request (default: qwen2.5:3b-instruct,
+                            a small instruct model sized for CPU inference)
+  FILESTORE_SEARCH_LLM_TIMEOUT seconds, default 60 (CPU inference is slow;
+                            raise further if your CPU is weaker)
+  FILESTORE_SEARCH_LLM_MAX_CTX model context window in tokens (default 4096).
+                            Smaller (e.g. 2048) = lower RAM usage on CPU.
   FILESTORE_SEARCH_LLM_DISABLE=1  fully disable the LLM (pure FTS mode)
 """
 import os
@@ -62,12 +67,17 @@ def load_config():
         data_dir=os.path.abspath(os.path.expanduser(pick("data_dir", "FILESTORE_SEARCH_DATA", data_dir))),
         db_path=os.path.abspath(os.path.expanduser(pick("db_path", "FILESTORE_SEARCH_DB", db_path))),
         public_url=pick("public_url", "FILESTORE_SEARCH_URL", ""),
-        llm_base=pick("llm_base", "FILESTORE_SEARCH_LLM_BASE", "http://127.0.0.1:8000/v1"),
-        llm_model=pick("llm_model", "FILESTORE_SEARCH_LLM_MODEL", "local-model"),
+        # Default to Ollama serving a small instruct model on CPU. A 3B
+        # 4-bit model fits in ~2GB RAM and is fast enough on any modern
+        # CPU for the two jobs this app uses it for (query rewrite + short
+        # answers). See README "Local LLM on CPU" for sizing options.
+        llm_base=pick("llm_base", "FILESTORE_SEARCH_LLM_BASE", "http://127.0.0.1:11434/v1"),
+        llm_model=pick("llm_model", "FILESTORE_SEARCH_LLM_MODEL", "qwen2.5:3b-instruct"),
         # API key is optional: most local servers (Ollama, vLLM, llama.cpp,
         # LM Studio) don't need one; text-generation-webui does.
         llm_api_key=pick("llm_api_key", "FILESTORE_SEARCH_LLM_API_KEY", ""),
-        llm_timeout=float(pick("llm_timeout", "FILESTORE_SEARCH_LLM_TIMEOUT", 30)),
+        llm_timeout=float(pick("llm_timeout", "FILESTORE_SEARCH_LLM_TIMEOUT", 60)),
+        llm_max_ctx=int(pick("llm_max_ctx", "FILESTORE_SEARCH_LLM_MAX_CTX", 4096)),
         llm_disable=_env_bool("FILESTORE_SEARCH_LLM_DISABLE", bool(file_cfg.get("llm_disable", False))),
         max_results=int(pick("max_results", "FILESTORE_SEARCH_MAX_RESULTS", 25)),
         # files to skip (dotfiles, temp files)

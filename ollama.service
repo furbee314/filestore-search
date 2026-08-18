@@ -1,0 +1,36 @@
+# Ollama - local LLM server (CPU-only box)
+# Serves the small instruct model that filestore-search uses for query
+# rewriting and short answers. Install:
+#   curl -fsSL https://ollama.com/install.sh | sh
+#   ollama pull qwen2.5:3b-instruct
+# Then: systemctl enable --now ollama
+#
+# Notes for a CPU-only host:
+#   - OLLAMA_HOST=127.0.0.1 keeps it local; no GPU is required or used.
+#   - qwen2.5:3b-instruct (Q4_K_M) needs ~2.3GB for weights + a few hundred
+#     MB for the context/KV cache. A 4GB RAM box works; 8GB+ is comfortable.
+#   - Keep the context window modest (the app sends options.num_ctx=4096 by
+#     default; see FILESTORE_SEARCH_LLM_MAX_CTX). Raising it costs RAM.
+#   - OLLAMA_CONTEXT_LENGTH sets the server-side default window for models
+#     that don't get an explicit per-request num_ctx.
+
+[Unit]
+Description=Ollama LLM server (local, CPU)
+After=network.target
+
+[Service]
+Type=simple
+Environment=OLLAMA_HOST=127.0.0.1:11434
+Environment=OLLAMA_CONTEXT_LENGTH=4096
+# Be a good citizen on a shared CPU box: cap at ~6 cores so search/indexing
+# and the web UI still get CPU. Remove if this box is dedicated to the LLM.
+CPUQuota=600%
+ExecStart=/usr/local/bin/ollama serve
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

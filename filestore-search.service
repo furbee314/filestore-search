@@ -22,11 +22,15 @@ Environment=FILESTORE_SEARCH_ROOT=/opt/filestore-search
 Environment=FILESTORE_SEARCH_DATA=/mnt
 Environment=FILESTORE_SEARCH_DB=/var/lib/filestore-search/search.db
 # your local LLM service (OpenAI-compatible /v1/chat/completions)
-# Ollama:    http://127.0.0.1:11434/v1   model e.g. qwen2.5:7b
-# vLLM:      http://127.0.0.1:8000/v1    model = --served-model-name
-# tgi-webui: its OpenAI-compatible URL   model name + FILESTORE_SEARCH_LLM_API_KEY
-Environment=FILESTORE_SEARCH_LLM_BASE=http://127.0.0.1:8000/v1
-Environment=FILESTORE_SEARCH_LLM_MODEL=local-model
+# Default here: Ollama on this host, CPU, serving a 3B instruct model
+# (install: see ollama.service). Other options:
+# Ollama:    http://127.0.0.1:11434/v1  model e.g. qwen2.5:3b-instruct
+# vLLM:      http://127.0.0.1:8000/v1   model = --served-model-name
+# tgi-webui: its OpenAI-compatible URL  model name + FILESTORE_SEARCH_LLM_API_KEY
+# CPU boxes: keep the model small (3-7B 4-bit) and raise
+# FILESTORE_SEARCH_LLM_TIMEOUT (default 60s) if inference is slow.
+Environment=FILESTORE_SEARCH_LLM_BASE=http://127.0.0.1:11434/v1
+Environment=FILESTORE_SEARCH_LLM_MODEL=qwen2.5:3b-instruct
 Environment=FILESTORE_SEARCH_PORT=8080
 ExecStart=/usr/bin/python3 /opt/filestore-search/app.py --host 127.0.0.1 --port 8080
 Restart=on-failure
