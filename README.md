@@ -47,6 +47,7 @@ Zero third-party Python dependencies (stdlib only).
 | `nginx.conf.example` | nginx vhost: proxy UI+API, alias `/files/` to your store |
 | `make_test_data.py` | generates a synthetic vendor-named store for testing |
 | `mock_llm.py` | mock OpenAI-compatible LLM for testing without a real one |
+| `requirements.txt` | documents Python dependencies (none — stdlib only) + host-level LLM deps |
 | `test_e2e.py`, `test_download.py`, `test_robust.py` | end-to-end + robustness test scripts |
 
 ## Local LLM on CPU (default: Ollama + qwen2.5:3b-instruct)
@@ -59,6 +60,10 @@ points at a local Ollama server with a small instruct model:
    ```bash
    curl -fsSL https://ollama.com/install.sh | sh
    ```
+   The installer needs the `zstd` system package to unpack its tarball on
+   RHEL-family hosts (e.g. `dnf install zstd`; on Debian/Ubuntu
+   `apt-get install zstd`). No Python packages are needed — the app itself
+   is stdlib-only (see `requirements.txt`).
 2. **Pull the model** (Q4_K_M 4-bit; ~2.3GB download, ~2.6GB RAM resident):
    ```bash
    ollama pull qwen2.5:3b-instruct

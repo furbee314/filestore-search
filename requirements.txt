@@ -1,0 +1,12 @@
+# filestore-search has no third-party Python dependencies.
+# The web app, indexer, CLI, and tests are pure standard library (Python 3.8+).
+# Nothing to install here — `pip install -r requirements.txt` is a no-op.
+#
+# Host-level dependencies for the local CPU LLM (system packages, not Python
+# packages — see README "Local LLM on CPU"):
+#   - Ollama:
+#       curl -fsSL https://ollama.com/install.sh | sh
+#     The installer may need the system package `zstd` to unpack its tarball
+#     (e.g. `dnf install zstd` on RHEL 9 / `apt-get install zstd` on Debian).
+#   - Model:
+#       ollama pull qwen2.5:3b-instruct   # ~2.3GB, Q4_K_M, CPU-friendly
