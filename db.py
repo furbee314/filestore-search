@@ -226,9 +226,78 @@ def since_to_ts(value):
         return None
 
 
-def search(con, query, limit=25, category=None, platform=None, min_mtime=None,
-           sort="relevance"):
-    """Run a natural-language-ish search. Returns list of dicts.
+# Hard ceiling on how many candidate rows the re-ranker will consider in one
+# call. Keeps very broad queries (a single common token) bounded while still
+# covering every page a UI would realistically flip through.
+_MAX_POOL = 5000
+
+
+def _filters_sql(table, category, platform, min_mtime, extra=""):
+    """Append shared category/platform/min_mtime filter clauses.
+
+    ``table`` is the column prefix (``f`` or bare), ``extra`` is any clause
+    already built (the MATCH / WHERE ... LIKE part). Returns (sql, params).
+    """
+    prefix = table + "." if table else ""
+    sql = extra
+    params = []
+    if category:
+        sql += f" AND {prefix}category = ?"
+        params.append(category)
+    if platform:
+        sql += f" AND {prefix}platform = ?"
+        params.append(platform)
+    if min_mtime is not None:
+        sql += f" AND {prefix}mtime >= ?"
+        params.append(min_mtime)
+    return sql, params
+
+
+def count_matches(con, query, category=None, platform=None, min_mtime=None):
+    """Total number of files a keyword search would return.
+
+    Mirrors the FTS-or-LIKE behaviour of :func:`search` so the UI can show an
+    accurate "of N" total and build a pagination bar. Returns 0 when the query
+    has no tokens (search() returns [] in that case too).
+    """
+    q = fts_query(query)
+    if not q:
+        return 0
+    base = "SELECT COUNT(*) FROM files_fts JOIN files f ON f.id = files_fts.rowid WHERE files_fts MATCH ?"
+    sql, params = _filters_sql("f", category, platform, min_mtime,
+                               extra=base + " ")
+    params = [q] + params
+    n = con.execute(sql, params).fetchone()[0]
+    if n:
+        return n
+    # LIKE fallback count (used when FTS matches nothing).
+    like_q = "%" + query.strip().lower()[:40] + "%"
+    base2 = ("SELECT COUNT(*) FROM files "
+             "WHERE (lower(description) LIKE ? OR lower(name) LIKE ?)")
+    sql2, params2 = _filters_sql("", category, platform, min_mtime,
+                                 extra=base2)
+    params2 = [like_q, like_q] + params2
+    return con.execute(sql2, params2).fetchone()[0]
+
+
+def count_filtered(con, category=None, platform=None, min_mtime=None):
+    """Total files matching the filters only (no keyword match).
+
+    This is the 'latest / newest' store-wide fallback path: every file under
+    the given category/platform/modified-since filter.
+    """
+    sql, params = _filters_sql("", category, platform, min_mtime,
+                               extra="SELECT COUNT(*) FROM files ")
+    return con.execute(sql, params).fetchone()[0]
+
+
+def search(con, query, limit=25, offset=0, category=None, platform=None,
+           min_mtime=None, sort="relevance"):
+    """Run a natural-language-ish search. Returns a page of result dicts.
+
+    ``offset`` (zero-based) selects the page within the ranked result set;
+    call :func:`count_matches` for the total length of that set to drive
+    pagination.
 
     Strategy: two FTS5 passes.
       1. OR pass (high recall) over all tokens
@@ -245,7 +314,12 @@ def search(con, query, limit=25, category=None, platform=None, min_mtime=None,
     q = fts_query(query)
     if not q:
         return []
-    params = [q]
+    off = max(0, int(offset))
+    lim = max(1, int(limit))
+    # Candidate pool large enough to cover the requested page plus re-rank
+    # headroom, capped so a very broad query stays bounded.
+    pool = min(max(off + lim, lim * (50 if sort == "mtime" else 3)), _MAX_POOL)
+
     sql = """
       SELECT f.id, f.path, f.name, f.category, f.platform, f.arch, f.file_type,
              f.version, f.vendor, f.description, f.size, f.mtime,
@@ -254,24 +328,18 @@ def search(con, query, limit=25, category=None, platform=None, min_mtime=None,
       JOIN files f ON f.id = files_fts.rowid
       WHERE files_fts MATCH ?
     """
-    if category:
-        sql += " AND f.category = ?"
-        params.append(category)
-    if platform:
-        sql += " AND f.platform = ?"
-        params.append(platform)
-    if min_mtime is not None:
-        sql += " AND f.mtime >= ?"
-        params.append(min_mtime)
+    sql, fparams = _filters_sql("f", category, platform, min_mtime,
+                                extra=sql)
+    params: list = [q] + fparams
     if sort == "mtime":
         # Pull a generous candidate pool so the Python re-rank (relevance
         # first, recency as tie-breaker) can pick the right files even when
         # the most relevant match is not among the very newest.
         sql += " ORDER BY f.mtime DESC, f.id DESC LIMIT ?"
-        params.append(min(int(limit * 50), 1000) or 1000)
+        params.append(pool)
     else:
         sql += " ORDER BY score LIMIT ?"
-        params.append(int(limit * 3))
+        params.append(pool)
 
     rows = con.execute(sql, params).fetchall()
     if not rows:
@@ -283,21 +351,17 @@ def search(con, query, limit=25, category=None, platform=None, min_mtime=None,
                          1e8 AS score
                   FROM files
                   WHERE (lower(description) LIKE ? OR lower(name) LIKE ?)"""
-        p2 = [like_q, like_q]
-        if category:
-            sql2 += " AND category = ?"
-            p2.append(category)
-        if platform:
-            sql2 += " AND platform = ?"
-            p2.append(platform)
-        if min_mtime is not None:
-            sql2 += " AND mtime >= ?"
-            p2.append(min_mtime)
+        sql2, fparams2 = _filters_sql("", category, platform, min_mtime,
+                                      extra=sql2)
+        p2 = [like_q, like_q] + fparams2
+        pool2 = min(off + lim, _MAX_POOL)
         if sort == "mtime":
-            sql2 += " ORDER BY mtime DESC, id DESC LIMIT ?"
+            sql2 += " ORDER BY mtime DESC, id DESC LIMIT ? OFFSET ?"
+            p2 += [pool2, off]
         else:
-            sql2 += " LIMIT ?"
-        p2.append(limit)
+            # deterministic order so repeated pages are stable
+            sql2 += " ORDER BY id LIMIT ? OFFSET ?"
+            p2 += [pool2, off]
         rows = con.execute(sql2, p2).fetchall()
 
     results = []
@@ -326,15 +390,18 @@ def search(con, query, limit=25, category=None, platform=None, min_mtime=None,
     for d in results:
         d.pop("score", None)
         d.pop("matched", None)
-    return results[:limit]
+    return results[off:off + lim]
 
 
-def newest(con, limit, category=None, platform=None, min_mtime=None):
+def newest(con, limit, offset=0, category=None, platform=None, min_mtime=None):
     """Return the most recently modified files, optionally filtered.
 
     This is the 'latest / newest / recent' path: no full-text matching, just
-    recency. category/platform/min_mtime are applied as filters.
+    recency. category/platform/min_mtime are applied as filters. ``offset``
+    (zero-based) selects a page; the total matching set is available via
+    :func:`count_filtered`.
     """
+    off = max(0, int(offset))
     sql = """SELECT id, path, name, category, platform, arch, file_type,
                     version, vendor, description, size, mtime
              FROM files"""
@@ -351,8 +418,9 @@ def newest(con, limit, category=None, platform=None, min_mtime=None):
         params.append(min_mtime)
     if conds:
         sql += " WHERE " + " AND ".join(conds)
-    sql += " ORDER BY mtime DESC, id DESC LIMIT ?"
+    sql += " ORDER BY mtime DESC, id DESC LIMIT ? OFFSET ?"
     params.append(int(limit))
+    params.append(off)
     rows = con.execute(sql, params).fetchall()
     return [{
         "id": r[0], "path": r[1], "name": r[2], "category": r[3],

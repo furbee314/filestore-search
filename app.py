@@ -6,8 +6,12 @@ Endpoints:
   GET /app.js           -> front-end logic
   GET /api/health       -> {ok, llm, total, db, ...}
   GET /api/facets       -> category/platform filters + counts
-  GET /api/search?q=&category=&platform=&limit=&answer=1
-                         -> {query, results:[...], answer:"..."}
+  GET /api/search?q=&category=&platform=&limit=&offset=&answer=1
+                         -> {query, results:[...], answer:"...",
+                             total, offset, limit, pages}
+                           results holds one page (limit rows from offset);
+                           total is the full result-set length, pages the
+                           number of pages at that limit.
                            answer is present only when answer=1 and the LLM
                            is reachable; on failure answer is null and the
                            deterministic results are still returned.
@@ -64,8 +68,8 @@ def get_state():
 # handlers
 # ---------------------------------------------------------------------------
 
-def do_search(q, category=None, platform=None, limit=25, want_answer=False,
-              sort=None, since=None):
+def do_search(q, category=None, platform=None, limit=25, offset=0,
+              want_answer=False, sort=None, since=None):
     st = get_state()
     llm = st["llm"]
     used_llm = False
@@ -75,6 +79,8 @@ def do_search(q, category=None, platform=None, limit=25, want_answer=False,
     plat = platform
     ver = None
     since_ts = db.since_to_ts(since)
+    off = max(0, int(offset))
+    lim = max(1, int(limit))
     # recency can also come from the LLM's rewrite (a real LLM may set the
     # 'since' filter when the user names a time window)
     since_ts_from_llm = None
@@ -104,18 +110,22 @@ def do_search(q, category=None, platform=None, limit=25, want_answer=False,
 
     def run(cat_, plat_, recency_order=False):
         with st["lock"]:
-            return db.search(st["con"], query, limit=limit,
+            return db.search(st["con"], query, limit=lim, offset=off,
                              category=cat_, platform=plat_,
                              min_mtime=since_ts,
                              sort="mtime" if recency_order else "relevance")
 
     def runr(cat_, plat_):
         with st["lock"]:
-            return db.newest(st["con"], limit, category=cat_,
+            return db.newest(st["con"], lim, offset=off, category=cat_,
                              platform=plat_, min_mtime=since_ts)
 
     def loosen(fn, c, p):
-        """Run fn, and if empty, retry with progressively looser filters."""
+        """Run fn, and if empty, retry with progressively looser filters.
+
+        Returns (results, cat_used, plat_used) so the caller can compute the
+        total against the same effective filter set that produced the results.
+        """
         res = fn(c, p)
         if not res:
             for c2, p2 in ((None, p), (c, None), (None, None)):
@@ -123,8 +133,9 @@ def do_search(q, category=None, platform=None, limit=25, want_answer=False,
                     continue
                 res = fn(c2, p2)
                 if res:
-                    break
-        return res
+                    return res, c2, p2
+            return res, c, p
+        return res, c, p
 
     explicit_newest = sort in ("newest", "mtime")
     # Recency intent: an explicit ?sort=newest, or the word 'latest/newest/
@@ -132,22 +143,39 @@ def do_search(q, category=None, platform=None, limit=25, want_answer=False,
     recency = explicit_newest or bool(
         RECENT_RE.search(q or "")) or bool(RECENT_RE.search(query or ""))
 
+    # Decide the result path ONCE (page-independent), before fetching the
+    # requested page, so the total and the bar stay consistent across pages.
+    # For recency we only use the keyword-matched, mtime-ordered set if it has
+    # at least one member; a bare "latest" (no real keywords) falls back to the
+    # store-wide most-recent files instead.
+    cat_eff = plat_eff = None
     if recency:
-        # "most recent" — order by most-recently-modified. When the user also
-        # named keywords (e.g. "latest Dell R740 firmware") we restrict to the
-        # matching files; for a bare "latest" the keyword set is the recency
-        # words themselves, which match nothing, so we fall back to the
-        # store-wide most-recent files (never an empty page).
         order = "mtime"
-        results = loosen(lambda c, p: run(c, p, recency_order=True), cat, plat)
-        if not results:
-            results = loosen(runr, cat, plat)
+        kw_count = 0
+        with st["lock"]:
+            kw_count = db.count_matches(st["con"], query, category=cat,
+                                        platform=plat, min_mtime=since_ts)
+        if kw_count:
+            # keyword set is non-empty: page through it (loosening filters only
+            # kicks in if the current page happens to come back empty)
+            results, cat_eff, plat_eff = loosen(
+                lambda c, p: run(c, p, recency_order=True), cat, plat)
+            total = db.count_matches(st["con"], query, category=cat_eff,
+                                     platform=plat_eff, min_mtime=since_ts)
+        else:
+            # no keyword matches: fall back to store-wide most-recent files
+            results, cat_eff, plat_eff = loosen(runr, cat, plat)
+            total = db.count_filtered(st["con"], category=cat_eff,
+                                      platform=plat_eff,
+                                      min_mtime=since_ts)
     else:
         order = "relevance"
         # Robustness: if the LLM (or user) filters were too aggressive and
         # wiped out the results, retry with progressively looser filters
         # rather than returning an empty page.
-        results = loosen(lambda c, p: run(c, p), cat, plat)
+        results, cat_eff, plat_eff = loosen(lambda c, p: run(c, p), cat, plat)
+        total = db.count_matches(st["con"], query, category=cat_eff,
+                                 platform=plat_eff, min_mtime=since_ts)
 
     answer = None
     if want_answer:
@@ -159,6 +187,7 @@ def do_search(q, category=None, platform=None, limit=25, want_answer=False,
             except Exception as e:
                 answer = f"(LLM unavailable: {e})"
 
+    pages = max(1, -(-total // lim)) if total else (1 if results else 0)
     return {
         "query": q,
         "rewritten_query": query if used_llm else None,
@@ -167,6 +196,10 @@ def do_search(q, category=None, platform=None, limit=25, want_answer=False,
         "results": results,
         "answer": answer,
         "count": len(results),
+        "total": total,
+        "offset": off,
+        "limit": lim,
+        "pages": pages,
         "sort": order,
         "since": since,
     }
@@ -226,7 +259,11 @@ class Handler(BaseHTTPRequestHandler):
             q = (qs.get("q") or "").strip()
             if not q:
                 return self._send(400, json.dumps({"error": "missing q"}))
-            limit = min(int(qs.get("limit") or 25), 100)
+            limit = min(int(qs.get("limit") or 20), 100)
+            try:
+                offset = max(int(qs.get("offset") or 0), 0)
+            except (TypeError, ValueError):
+                offset = 0
             cat = qs.get("category") or None
             plat = qs.get("platform") or None
             want_answer = qs.get("answer") in ("1", "true", "yes")
@@ -234,7 +271,8 @@ class Handler(BaseHTTPRequestHandler):
             since = qs.get("since") or None
             try:
                 out = do_search(q, category=cat, platform=plat, limit=limit,
-                                want_answer=want_answer, sort=sort, since=since)
+                                offset=offset, want_answer=want_answer,
+                                sort=sort, since=since)
             except Exception as e:
                 return self._send(500, json.dumps({"error": str(e)}))
             return self._send(200, json.dumps(out))
@@ -301,12 +339,12 @@ UI_HTML = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>File Store Search</title>
+<title>Search the Vault</title>
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
 <header>
-  <h1>File Store Search</h1>
+  <h1><a id="home" class="home" href="/">Search the Vault</a></h1>
   <div id="status" class="status"></div>
 </header>
 <main>
@@ -319,6 +357,7 @@ UI_HTML = r"""<!doctype html>
   <div id="answer" class="answer" hidden></div>
   <div id="meta" class="meta"></div>
   <div id="results"></div>
+  <div id="pagination" class="pagination"></div>
   <div id="loading" class="loading" hidden>Searching&#8230;</div>
 </main>
 <footer>100% offline &middot; search index rebuilt periodically &middot; downloads via your nginx site or /files/</footer>
@@ -335,6 +374,8 @@ body { margin:0; background:var(--bg); color:var(--ink);
 header { display:flex; justify-content:space-between; align-items:center;
          padding:14px 22px; background:var(--panel); border-bottom:1px solid var(--line); }
 h1 { font-size:18px; margin:0; letter-spacing:.3px; }
+h1 a.home { color:var(--ink); text-decoration:none; }
+h1 a.home:hover { color:var(--acc); }
 .status { font-size:12.5px; color:var(--mut); }
 .status b { color:var(--ink); }
 main { max-width:1050px; margin:0 auto; padding:18px 22px 60px; }
@@ -364,6 +405,9 @@ tr:hover td { background:#22304a; }
 .name { font-weight:600; word-break:break-all; }
 .path { color:var(--mut); font-size:12.5px; font-family:ui-monospace,Menlo,Consolas,monospace;
   word-break:break-all; }
+a.parent { color:var(--acc); font-size:12px; text-decoration:none; margin-top:3px;
+  display:inline-block; }
+a.parent:hover { text-decoration:underline; }
 .badge { display:inline-block; padding:2px 7px; border-radius:20px; font-size:11.5px;
   background:#0b1220; border:1px solid var(--line); color:var(--mut); white-space:nowrap; }
 .badge.cat { color:var(--acc); border-color:var(--acc); }
@@ -373,6 +417,15 @@ a.dl { color:var(--acc); text-decoration:none; }
 a.dl:hover { text-decoration:underline; }
 .loading { color:var(--mut); margin:18px 0; }
 .empty { color:var(--mut); margin:18px 0; }
+.pagination { display:flex; gap:5px; align-items:center; justify-content:center;
+  flex-wrap:wrap; margin:18px 0 4px; }
+.pagination button { background:var(--panel); color:var(--ink); border:1px solid var(--line);
+  border-radius:6px; padding:5px 11px; font-size:13px; cursor:pointer; min-width:34px; }
+.pagination button:hover:not(:disabled) { border-color:var(--acc); color:var(--acc); }
+.pagination button.cur { background:var(--acc); color:#082032; border-color:var(--acc);
+  font-weight:600; }
+.pagination button:disabled { opacity:.4; cursor:default; }
+.pagination .pgdots { color:var(--mut); padding:0 2px; }
 footer { text-align:center; color:var(--mut); font-size:12px; padding:16px;
   border-top:1px solid var(--line); margin-top:30px; }
 @media (max-width:640px){ th,td{padding:6px} .path{display:none} .mtime{display:none} }
@@ -382,6 +435,11 @@ JS = r"""
 'use strict';
 const $ = id => document.getElementById(id);
 let facets = null;
+let page = 1; // current page (1-based) of the active result set
+
+// Base URL = the origin the page was reached from (the same URL used to
+// access the site). Everything else in the UI is derived from it.
+const BASE_URL = document.location.origin;
 
 function fmtSize(b){ if(!b) return '';
   const u=['B','KB','MB','GB','TB']; let i=0; b=+b;
@@ -409,11 +467,19 @@ function renderFilters(){
   for(const p of facets.platforms)
     h += `<option value="${esc(p)}">${esc(p)}</option>`;
   h += '</select><select id="f-sort"><option value="">Sort: Relevance</option>'
-     + '<option value="newest">Sort: Newest first</option></select>';
+     + '<option value="newest">Sort: Newest first</option></select>'
+     + '<label class="chk limit-lbl"><span>Results per page</span>'
+     + '<select id="f-limit">'
+     + [5,10,20,50,100].map(n=>`<option value="${n}">${n}${n===20?' (default)':''}</option>`).join('')
+     + '</select></label>';
   f.innerHTML = h;
-  $('f-cat').onchange = doSearch;
-  $('f-plat').onchange = doSearch;
-  $('f-sort').onchange = doSearch;
+  const reset = () => { page = 1; doSearch(); };
+  $('f-cat').onchange = reset;
+  $('f-plat').onchange = reset;
+  $('f-sort').onchange = reset;
+  $('f-limit').onchange = reset; // changing page size re-starts from page 1
+  // default to 20 results per page
+  $('f-limit').value = '20';
 }
 
 async function health(){
@@ -425,15 +491,31 @@ async function health(){
   }catch(e){ $('status').textContent='index unavailable'; }
 }
 
+// Parent-folder link target for a result: the directory the file sits in.
+// The base URL is exactly the URL the user used to reach this page
+// (document.location origin), so it works whether the UI is served at
+// "/", on a port, or behind nginx at a sub-path. A file directly at the
+// store root has a parent of just the site root. A trailing slash marks
+// it as a directory (it collapses to "<baseurl>/" at the root).
+function parentHref(path){
+  const p = String(path||'');
+  const i = p.lastIndexOf('/');
+  const dir = i > 0 ? p.slice(0, i) : ''; // '' when the file is at the root
+  return dir ? BASE_URL + '/' + dir + '/' : BASE_URL + '/';
+}
+
 async function doSearch(){
   const q = $('q').value.trim();
   if(!q) return;
   const cat = $('f-cat')?.value || '';
   const plat = $('f-plat')?.value || '';
   const sort = $('f-sort')?.value || '';
+  const limit = $('f-limit')?.value || '20';
   const want = $('want-answer').checked;
+  const offset = (page - 1) * +limit;
   $('loading').hidden=false; $('answer').hidden=true; $('results').innerHTML='';
-  const url = `/api/search?q=${encodeURIComponent(q)}&limit=25`
+  $('pagination').innerHTML='';
+  const url = `/api/search?q=${encodeURIComponent(q)}&limit=${encodeURIComponent(limit)}&offset=${offset}`
     + (cat?`&category=${encodeURIComponent(cat)}`:'')
     + (plat?`&platform=${encodeURIComponent(plat)}`:'')
     + (sort?`&sort=${encodeURIComponent(sort)}`:'')
@@ -443,17 +525,51 @@ async function doSearch(){
     $('loading').hidden=true;
     if(d.error){ $('results').innerHTML = `<div class="empty">${esc(d.error)}</div>`; return; }
     renderMeta(d);
-    if(d.answer){ $('answer').textContent = d.answer; $('answer').hidden=false; }
+    if(d.answer && page===1){ $('answer').textContent = d.answer; $('answer').hidden=false; }
     else $('answer').hidden=true;
     renderResults(d.results||[]);
+    renderPagination(d);
   }catch(e){
     $('loading').hidden=true;
     $('results').innerHTML = `<div class="empty">Request failed: ${esc(e.message)}</div>`;
   }
 }
 
+function gotoPage(p){
+  page = Math.max(1, p);
+  doSearch();
+  window.scrollTo({top:0, behavior:'smooth'});
+}
+
+function renderPagination(d){
+  const el = $('pagination');
+  const total = d.total||0, limit = d.limit||+($('f-limit').value||'20');
+  const pages = Math.max(1, Math.ceil(total/limit));
+  // No bar when there is nothing to navigate (single page or empty set).
+  if(d.error || total<=0 || pages<=1){ el.innerHTML=''; return; }
+  const cur = page;
+  // Compact window of page numbers around the current page.
+  const win = 2; // pages shown on each side of current
+  const lo = Math.max(1, cur-win), hi = Math.min(pages, cur+win);
+  let h = '';
+  h += `<button class="pgnav" ${cur===1?'disabled':''} onclick="gotoPage(${cur-1})">&laquo; Prev</button>`;
+  if(lo>1){ h += `<button class="pgnum" onclick="gotoPage(1)">1</button>`; if(lo>2) h += `<span class="pgdots">&hellip;</span>`; }
+  for(let p=lo;p<=hi;p++)
+    h += `<button class="pgnum ${p===cur?'cur':''}" onclick="gotoPage(${p})">${p}</button>`;
+  if(hi<pages){ if(hi<pages-1) h += `<span class="pgdots">&hellip;</span>`; h += `<button class="pgnum" onclick="gotoPage(${pages})">${pages}</button>`; }
+  h += `<button class="pgnav" ${cur===pages?'disabled':''} onclick="gotoPage(${cur+1})">Next &raquo;</button>`;
+  el.innerHTML = h;
+}
+
 function renderMeta(d){
-  let h = `${d.count} result${d.count===1?'':'s'} for &#8220;${esc(d.query)}&#8221;`;
+  const total = d.total||d.count||0;
+  const limit = d.limit||d.count||0;
+  const off = d.offset||0;
+  const from = off+1;
+  const to = off + d.count;
+  let h = total ? `Showing ${from}&ndash;${to} of ${total} result${total===1?'':'s'}`
+                : `${d.count||0} result${(d.count||0)===1?'':'s'}`;
+  h += ` for &#8220;${esc(d.query)}&#8221;`;
   if(d.sort==='mtime') h += ` &middot; <span class="rw">sorted newest first</span>`;
   if(d.since) h += ` &middot; modified since ${esc(d.since)}`;
   if(d.rewritten_query && d.rewritten_query!==d.query)
@@ -467,8 +583,10 @@ function renderResults(rows){
   let h = `<table><thead><tr><th>File</th><th>Category</th><th>Platform</th><th>Version</th><th>Modified</th><th>Size</th><th></th></tr></thead><tbody>`;
   for(const r of rows){
     const dl = `/files/${encodeURIComponent(r.path)}`;
+    const purl = parentHref(r.path);
     h += `<tr>
-      <td><div class="name">${esc(r.name)}</div><div class="path">${esc(r.path)}</div></td>
+      <td><div class="name">${esc(r.name)}</div><div class="path">${esc(r.path)}</div>
+      <a class="parent" href="${esc(purl)}" title="Browse this file's folder in the store">Parent folder</a></td>
       <td><span class="badge cat">${esc(r.category)}</span></td>
       <td>${esc(r.platform)}${r.arch!=='unknown'?` <span class="badge">${esc(r.arch)}</span>`:''}</td>
       <td>${esc(r.version)||'&ndash;'}</td>

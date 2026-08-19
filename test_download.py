@@ -18,7 +18,7 @@ def get(path, headers=None):
 
 # UI page
 st, hdr, body = get("/")
-assert st == 200 and b"File Store Search" in body, "UI page failed"
+assert st == 200 and b"Search the Vault" in body, "UI page failed"
 print("UI page OK,", len(body), "bytes, content-type:", hdr.get("Content-Type"))
 
 # css + js
