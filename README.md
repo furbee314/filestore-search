@@ -255,13 +255,20 @@ python3 test_e2e.py && python3 test_download.py && python3 test_robust.py
 1. Your free-text query hits `/api/search`.
 2. If the LLM is enabled, it rewrites the query into:
    - a tightened keyword query (filler words dropped, model numbers kept)
-   - a `category` filter (firmware, linux-rpm, windows-msi, ...)
+   - a `category` filter (firmware, linux-rpm, windows-msi, windows-patch,
+     linux-installer, ...)
    - a `platform` filter (rhel, ubuntu, windows, ...)
    - an optional `version` token
    - an optional `since` date when you ask for "files since <date>"
 3. SQLite FTS5 (OR-matched tokens, `bm25` ranking + a "more tokens matched
    = higher rank" re-rank) returns results; LIKE fallback catches very short
-   queries.
+   queries. The re-rank also folds in a per-file **deliverable priority** so
+   installables (`.rpm/.deb/.msi/.msu/.exe/.sh` installers, ISOs, BIOS/firmware
+   bundles, drivers) outrank the paperwork that lives next to them: docs
+   (`.txt`/`.pdf`/readmes) rank last, repo metadata/manifests
+   (`repomd.xml`, `Packages.gz`, GPG keys) below, and archives in between.
+   This is why "dell r740 bios" returns the BIOS file rather than a readme
+   that merely mentions it.
 4. Optional `&answer=1`: the LLM writes a short plain-English answer naming
    the best file(s) and their download path, based only on the top results
    (it cannot invent files).

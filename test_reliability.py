@@ -155,6 +155,38 @@ print(f"checksum sidecars excluded "
       f"({on_disk} on disk, {total_no_sidecars} indexed): OK")
 
 # ---------------------------------------------------------------------------
+# deliverable priority: installables rank above their paperwork
+# ---------------------------------------------------------------------------
+def prio(name):
+    r = con.execute("SELECT priority FROM files WHERE name=?", (name,)).fetchone()
+    return r[0] if r else None
+
+assert prio("readme-how-to-install-drivers.txt") == 0, \
+    f"doc should be priority 0, got {prio('readme-how-to-install-drivers.txt')}"
+assert prio("SymantecLinuxInstaller") == 3, \
+    f"no-ext installer should be priority 3, got {prio('SymantecLinuxInstaller')}"
+assert prio("install-symantec-endpoint.sh") == 3, \
+    f".sh installer should be priority 3, got {prio('install-symantec-endpoint.sh')}"
+assert prio("dell-om-agent-7.4.0-win-x64.msu") == 3, \
+    f".msu patch should be priority 3, got {prio('dell-om-agent-7.4.0-win-x64.msu')}"
+assert prio("repomd.xml") == 1, \
+    f"repo metadata should be priority 1, got {prio('repomd.xml')}"
+assert prio("Packages.gz") == 1, \
+    f"repo manifest should be priority 1, got {prio('Packages.gz')}"
+print("priority stored per file type (rpm/.msu/.sh/no-ext=3, metadata=1, doc=0): OK")
+
+# an installable that matches the same tokens must outrank the readme of the
+# same software (matched-token count is tied; priority breaks it)
+rows = db.search(con, "install", limit=50)
+names = [r["name"] for r in rows]
+need = ("install-symantec-endpoint.sh", "readme-how-to-install-drivers.txt")
+assert all(n in names for n in need), \
+    f"expected both installable and readme in the pool, got {names[:10]}"
+assert names.index(need[0]) < names.index(need[1]), \
+    f"installable should rank above its paperwork: {names[:8]}"
+print("installable ranks above its paperwork at equal relevance: OK")
+
+# ---------------------------------------------------------------------------
 # 1+2. app-level: rewrite cache + guardrails, with a stubbed flaky LLM
 # ---------------------------------------------------------------------------
 print("\n== rewrite cache + guardrails (stubbed LLM) ==")

@@ -38,9 +38,9 @@ Return ONLY a JSON object with these keys (no prose, no markdown fences):
   "any_of": "null, or a list of 1-4 alternative words from an 'X or Y'
             request. A result matches when it has ANY one of these; every
             word in 'query' is still required.",
-  "category": one of [linux-rpm, linux-deb, linux-source, windows-msi,
-            windows-exe, windows-driver, windows-other, firmware, driver,
-            iso, generic, null],
+  "category": one of [linux-rpm, linux-deb, linux-source, linux-installer,
+            windows-msi, windows-exe, windows-patch, windows-driver,
+            windows-other, firmware, driver, iso, generic, null],
   "platform": one of [rhel, sles, opensuse, ubuntu, debian, linux, windows,
             firmware, unknown, null],
   "version": "a specific version if the user named one, else null",
@@ -91,9 +91,9 @@ Rules:
 # the whitelist (small models occasionally invent values like "linux-driver")
 # is discarded so it can't zero out the result set.
 _VALID_CATEGORIES = frozenset(
-    {"linux-rpm", "linux-deb", "linux-source", "windows-msi", "windows-exe",
-     "windows-driver", "windows-other", "firmware", "driver", "iso",
-     "generic"})
+    {"linux-rpm", "linux-deb", "linux-source", "linux-installer",
+     "windows-msi", "windows-exe", "windows-patch", "windows-driver",
+     "windows-other", "firmware", "driver", "iso", "generic"})
 _VALID_PLATFORMS = frozenset(
     {"rhel", "sles", "opensuse", "ubuntu", "debian", "linux", "windows",
      "firmware", "unknown"})

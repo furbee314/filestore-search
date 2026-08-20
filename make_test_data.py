@@ -65,6 +65,14 @@ FILES = [
     "Software_Library/User_Software/windows/visual-cpp-redistributable-2015-2022-x64.exe",
     "Software_Library/User_Software/windows/powershell-7.4.3-win-x64.msi",
     "Software_Library/User_Software/misc/readme-how-to-install-drivers.txt",
+    # --- installers without a conventional extension / via .sh (priority 3) ---
+    "Software_Library/Drivers/linux/symantec/SymantecLinuxInstaller",
+    "Software_Library/Drivers/linux/symantec/install-symantec-endpoint.sh",
+    # --- Windows Update / patch bundles (.msu, priority 3) ---
+    "Software_Library/Drivers/windows/dell/dell-om-agent-7.4.0-win-x64.msu",
+    # --- repo metadata / manifests (priority 1, demoted below deliverables) ---
+    "repos/RHEL9/repodata/repomd.xml",
+    "repos/RHEL9/Packages.gz",
     # --- isos (install / boot media) ---
     "isos/rhel-9.4-x86_64-dvd.iso",
     "isos/rhel-9.4-aarch64-dvd.iso",

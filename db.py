@@ -5,7 +5,8 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 
-from indexer import SCHEMA, SCHEMA_VERSION, classify, extract_version, extract_vendor, extract_description
+from indexer import (SCHEMA, SCHEMA_VERSION, classify, extract_version,
+                     extract_vendor, extract_description, priority_for)
 
 
 def connect(cfg, check_same_thread=True):
@@ -21,9 +22,49 @@ def connect(cfg, check_same_thread=True):
 
 def ensure_schema(con):
     con.executescript(SCHEMA)
-    con.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
-                (str(SCHEMA_VERSION),))
+    _migrate(con)
+    # upsert (not INSERT OR IGNORE): an existing v1 row must advance to 2,
+    # otherwise _migrate re-runs its full-table backfill on every connect.
+    con.execute(
+        "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (str(SCHEMA_VERSION),))
     con.commit()
+
+
+def _migrate(con):
+    """In-place upgrades for existing databases.
+
+    v1 -> v2: add the ``files.priority`` column (deliverable weight) and
+    backfill it for rows already in the index. Gated on the stored
+    schema_version so the backfill (which rescans deliverable rows) runs
+    exactly once, not on every connect.
+    """
+    has_table = con.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='files'"
+    ).fetchone()[0]
+    if not has_table:
+        return
+    cols = {r[1] for r in con.execute("PRAGMA table_info(files)")}
+    row = con.execute(
+        "SELECT value FROM meta WHERE key = 'schema_version'"
+    ).fetchone()
+    prev = int(row[0]) if row and str(row[0]).isdigit() else 0
+    if prev >= 2:
+        return
+    if "priority" not in cols:
+        con.execute(
+            "ALTER TABLE files ADD COLUMN priority INTEGER NOT NULL DEFAULT 3")
+    # Backfill: every row in a v1 DB has priority=3 (the ALTER default), so
+    # recompute from the stored name/category/file_type. Real deliverables
+    # come back to 3 (no-op); docs/metadata drop to their true weight.
+    stale = con.execute(
+        "SELECT id, name, category, file_type FROM files"
+    ).fetchall()
+    con.executemany(
+        "UPDATE files SET priority = ? WHERE id = ?",
+        [(priority_for(cat, ftype, name), i)
+         for i, name, cat, ftype in stale])
 
 
 def _row_from_file(root, relpath, st):
@@ -49,6 +90,7 @@ def _row_from_file(root, relpath, st):
         "size": st.st_size,
         "mtime": st.st_mtime,
         "indexed_at": time.time(),
+        "priority": priority_for(category, ext, name),
     }
 
 
@@ -98,13 +140,14 @@ def full_reindex(cfg, con, quiet=False):
     for i, r in enumerate(rows, start=1):
         files_rows.append((i, r["path"], r["name"], r["category"], r["platform"],
                            r["arch"], r["file_type"], r["version"], r["vendor"],
-                           r["description"], r["size"], r["mtime"], r["indexed_at"]))
+                           r["description"], r["size"], r["mtime"], r["indexed_at"],
+                           r["priority"]))
         fts_rows.append((i, r["path"], r["name"], r["version"], r["description"],
                          r["vendor"]))
     con.executemany(
         """INSERT INTO files (id, path, name, category, platform, arch, file_type,
-             version, vendor, description, size, mtime, indexed_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", files_rows)
+             version, vendor, description, size, mtime, indexed_at, priority)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", files_rows)
     con.executemany(
         "INSERT INTO files_fts(rowid, path, name, version, description, vendor)"
         " VALUES (?, ?, ?, ?, ?, ?)", fts_rows)
@@ -132,9 +175,10 @@ def incremental_refresh(cfg, con):
             con.execute(
                 """INSERT INTO files
                    (path, name, category, platform, arch, file_type, version, vendor,
-                    description, size, mtime, indexed_at)
+                    description, size, mtime, indexed_at, priority)
                    VALUES (:path, :name, :category, :platform, :arch, :file_type,
-                    :version, :vendor, :description, :size, :mtime, :indexed_at)""",
+                    :version, :vendor, :description, :size, :mtime, :indexed_at,
+                    :priority)""",
                 row)
             fid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
             con.execute(
@@ -156,7 +200,8 @@ def incremental_refresh(cfg, con):
             con.execute(
                 """UPDATE files SET name=:name, category=:category, platform=:platform,
                    arch=:arch, file_type=:file_type, version=:version, vendor=:vendor,
-                   description=:description, size=:size, mtime=:mtime, indexed_at=:indexed_at
+                   description=:description, size=:size, mtime=:mtime, indexed_at=:indexed_at,
+                   priority=:priority
                    WHERE path=:path""", row)
             con.execute(
                 "INSERT INTO files_fts(rowid, path, name, version, description, vendor)"
@@ -477,7 +522,7 @@ def search(con, query, limit=25, offset=0, category=None, platform=None,
 
     sql = """
       SELECT f.id, f.path, f.name, f.category, f.platform, f.arch, f.file_type,
-             f.version, f.vendor, f.description, f.size, f.mtime,
+             f.version, f.vendor, f.description, f.size, f.mtime, f.priority,
              bm25(files_fts, 10.0, 10.0, 5.0, 1.0, 1.0) AS score
       FROM files_fts
       JOIN files f ON f.id = files_fts.rowid
@@ -487,10 +532,14 @@ def search(con, query, limit=25, offset=0, category=None, platform=None,
                                 extra=sql)
     params: list = [expr] + fparams
     if sort == "mtime":
-        sql += " ORDER BY f.mtime DESC, f.id DESC LIMIT ?"
+        # recency within a deliverable class first: a .rpm updated yesterday
+        # should beat a readme updated yesterday, not a .rpm updated last week
+        sql += " ORDER BY f.priority DESC, f.mtime DESC, f.id DESC LIMIT ?"
         params.append(pool)
     else:
-        sql += " ORDER BY score LIMIT ?"
+        # bias the candidate pool toward installables so a broad query's
+        # re-rank headroom is spent on deliverables, not paperwork
+        sql += " ORDER BY f.priority DESC, score LIMIT ?"
         params.append(pool)
 
     rows = con.execute(sql, params).fetchall()
@@ -499,7 +548,7 @@ def search(con, query, limit=25, offset=0, category=None, platform=None,
         # tokens, punctuation-heavy queries)
         like_q = "%" + query.strip().lower()[:40] + "%"
         sql2 = """SELECT id, path, name, category, platform, arch, file_type,
-                         version, vendor, description, size, mtime,
+                         version, vendor, description, size, mtime, priority,
                          1e8 AS score
                   FROM files
                   WHERE (lower(description) LIKE ? OR lower(name) LIKE ?)"""
@@ -508,11 +557,11 @@ def search(con, query, limit=25, offset=0, category=None, platform=None,
         p2 = [like_q, like_q] + fparams2
         pool2 = min(off + lim, _MAX_POOL)
         if sort == "mtime":
-            sql2 += " ORDER BY mtime DESC, id DESC LIMIT ? OFFSET ?"
+            sql2 += " ORDER BY priority DESC, mtime DESC, id DESC LIMIT ? OFFSET ?"
             p2 += [pool2, off]
         else:
             # deterministic order so repeated pages are stable
-            sql2 += " ORDER BY id LIMIT ? OFFSET ?"
+            sql2 += " ORDER BY priority DESC, id LIMIT ? OFFSET ?"
             p2 += [pool2, off]
         rows = con.execute(sql2, p2).fetchall()
 
@@ -522,7 +571,8 @@ def search(con, query, limit=25, offset=0, category=None, platform=None,
             "id": r[0], "path": r[1], "name": r[2], "category": r[3],
             "platform": r[4], "arch": r[5], "file_type": r[6], "version": r[7],
             "vendor": r[8], "description": r[9], "size": r[10], "mtime": r[11],
-            "score": r[12],
+            "priority": r[12],
+            "score": r[13],
         }
         results.append(d)
     # re-rank: more matched tokens => better. Matching is word-boundary
@@ -530,6 +580,8 @@ def search(con, query, limit=25, offset=0, category=None, platform=None,
     # words are ignored so they can't inflate the score. Tokens = the AND
     # set plus the OR group, so a file matching the alternative term still
     # earns the match; the OR alternative that actually matched counts too.
+    # Deliverable priority is the secondary factor: a .rpm that matches the
+    # same tokens as a readme of the same software ranks above it.
     tokens = [t.lower() for t in fts_tokens(query)
               ] + [t.lower() for t in clean_or_terms(query, or_terms)]
     for d in results:
@@ -541,12 +593,13 @@ def search(con, query, limit=25, offset=0, category=None, platform=None,
     if sort == "mtime":
         # name as final tie-break: two files with the same relevance and
         # the same mtime sort in a fixed, predictable order.
-        results.sort(key=lambda d: (-d["matched"], -d["mtime"], d["name"]))
+        results.sort(key=lambda d: (-d["matched"], -d["priority"], -d["mtime"], d["name"]))
     else:
-        results.sort(key=lambda d: (-d["matched"], d["score"], d["name"]))
+        results.sort(key=lambda d: (-d["matched"], -d["priority"], d["score"], d["name"]))
     for d in results:
         d.pop("score", None)
         d.pop("matched", None)
+        d.pop("priority", None)
     return results[off:off + lim]
 
 

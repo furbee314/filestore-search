@@ -4,8 +4,18 @@ Walks the data directory, classifies each file, extracts metadata where
 possible, and writes to a FTS5-indexed SQLite database.
 
 Categories:
-  linux-rpm, linux-deb, linux-source, windows-msi, windows-exe, windows-other,
-  firmware, driver, generic
+  linux-rpm, linux-deb, linux-source, linux-installer,
+  windows-msi, windows-exe, windows-patch, windows-driver, windows-other,
+  firmware, driver, iso, generic
+
+Each file also gets a deliverable priority (0-3) that the search layer
+uses to rank actual software / patches / firmware above the docs, check
+sums, repo metadata and other housekeeping files that live next to them:
+  3  installable deliverable: rpm/deb/msi/msu/exe/cpl/sh installer/
+     extension, ISO install media, BIOS/firmware bundles, drivers
+  2  source / archive that may contain software (tar, zip, jar, ...)
+  1  repo metadata / manifests (repomd, release, Packages, control, ...)
+  0  documentation / text / other (readme, .txt, .log, ...)
 
 The database schema is versioned; `reindex` does a full rebuild, `refresh`
 does an incremental upsert/delete of changed files.
@@ -19,7 +29,7 @@ import sqlite3
 
 from config import load_config
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -35,7 +45,8 @@ CREATE TABLE IF NOT EXISTS files (
   description TEXT NOT NULL DEFAULT '',
   size INTEGER NOT NULL DEFAULT 0,
   mtime REAL NOT NULL DEFAULT 0,
-  indexed_at REAL NOT NULL DEFAULT 0
+  indexed_at REAL NOT NULL DEFAULT 0,
+  priority INTEGER NOT NULL DEFAULT 3
 );
 CREATE INDEX IF NOT EXISTS idx_files_category ON files(category);
 CREATE INDEX IF NOT EXISTS idx_files_platform ON files(platform);
@@ -162,9 +173,16 @@ def classify(filename, relpath):
     # windows packages / executables
     if base.endswith(".msi"):
         return ("windows-msi", "windows", "unknown")
+    if base.endswith((".msu", ".msp")):
+        # Windows Update / patch bundles
+        return ("windows-patch", "windows", "unknown")
     if base.endswith(".exe"):
         cat = "windows-driver" if DRIVER_NAME_PAT.search(filename) else "windows-exe"
         return (cat, "windows", "unknown")
+    if base.endswith(".sh"):
+        # shell installers / extensions (e.g. 'install-linux.sh',
+        # Symantec LinuxInstaller-style install scripts)
+        return ("linux-installer", "linux", "unknown")
 
     # firmware by name (zip/tar/loose bundles from BIOS/IDRAK/IPMI releases)
     if FIRMWARE_NAME_PAT.search(filename):
@@ -180,6 +198,18 @@ def classify(filename, relpath):
     if DRIVER_NAME_PAT.search(filename) and ext in ("zip", "tar", "gz", "tgz", "iso", "cab"):
         return ("driver", "unknown", "unknown")
 
+    # extension-less files that are still deliverables: vendor installers
+    # and patch binaries commonly ship with no extension
+    # ('SymantecLinuxInstaller', 'vnc72we_clhxe_nt_setup', 'setup')
+    if not ext and re.search(
+            r"(installer|install|setup|setupx?|patch|update|unattend|silent)",
+            base):
+        plat = "windows" if re.search(
+            r"(win\d?|nt[_ ]?setup|windows)", base) or "windows" in rl \
+            else "linux" if "linux" in rl else "unknown"
+        return ("linux-installer" if plat == "linux" else "windows-exe",
+                plat, "unknown")
+
     # fallback by directory hints
     if any(k in rl for k in ("windows", "msi")):
         return ("windows-other", "windows", "unknown")
@@ -190,6 +220,76 @@ def classify(filename, relpath):
     if "linux" in rl or "rpm" in rl or "deb" in rl:
         return ("generic", "linux", "unknown")
     return ("generic", "unknown", "unknown")
+
+
+# ---------------------------------------------------------------------------
+# deliverable priority
+# ---------------------------------------------------------------------------
+# The store holds, next to every real artifact, a pile of files that are
+# *about* software but are not themselves installable: checksum sidecars,
+# repo metadata, readme/docs, manifests. The FTS layer ranks by text
+# relevance, so a "how do I install X" or "X readme" note can outrank the
+# actual .rpm/.msu. `priority_for` gives each file a 0-3 weight the search
+# layer folds into the ranking so installables always beat their paperwork.
+
+# priority 3: installable deliverables
+_DELIVERABLE_CATS = {
+    "linux-rpm", "linux-deb", "linux-installer", "windows-msi",
+    "windows-exe", "windows-patch", "windows-driver", "firmware",
+    "driver", "iso",
+}
+# priority 3 extension override (covers files the category heuristic missed,
+# e.g. a .msu that fell into 'generic' because its name had no vendor hint)
+_DELIVERABLE_EXT = {
+    "rpm", "deb", "msi", "msu", "msp", "exe", "sh", "cpl", "iso",
+}
+# priority 2: archives that plausibly hold software
+_ARCHIVE_EXT = {
+    "zip", "tar", "gz", "tgz", "xz", "bz2", "7z", "rar", "jar", "whl",
+}
+# priority 1: repo metadata / manifests / signatures (not installable, but
+# often what a user actually wants when looking up a package)
+_METADATA_EXT = {
+    "repomd", "release", "gpg", "asc", "sig", "json", "ya", "idx",
+    "listindex", "index", "control", "xml",
+}
+# priority 0: documentation and other non-software. A .txt is never
+# installable even when a directory heuristic misclassifies it (e.g. a
+# readme inside a drivers/ folder).
+_DOC_EXT = {"txt", "log", "readme", "rst", "pdf", "html", "csv",
+            "md", "markdown"}
+# known manifest basenames that are metadata, not installables
+_MANIFEST_BASENAMES = {
+    "repomd.xml", "release", "packages", "repodata", "packages.gz",
+    "inrelease", "control", "control.index", "packagelist", "filelists",
+}
+
+
+def priority_for(category, file_type, name):
+    """Deliverable priority (0-3) for the search ranking.
+
+    3 installable (rpm/deb/msi/msu/exe/sh/iso/firmware/driver)
+    2 archive (zip/tar/... that may contain software)
+    1 repo metadata / manifest
+    0 docs / text / other
+
+    Extension and basename decide first, because the category heuristic is
+    name/path-driven and can mislabel paperwork as a deliverable.
+    """
+    ext = (file_type or "").lower()
+    base = os.path.basename(name).lower()
+    if base in _MANIFEST_BASENAMES:
+        return 1
+    if ext in _DOC_EXT:
+        return 0
+    if category in _DELIVERABLE_CATS or ext in _DELIVERABLE_EXT:
+        return 3
+    if ext in _METADATA_EXT:
+        return 1
+    if ext in _ARCHIVE_EXT:
+        return 2
+    # unknown: treat as a possible deliverable (be lenient)
+    return 2
 
 
 # ---------------------------------------------------------------------------
