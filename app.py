@@ -714,7 +714,11 @@ function renderResults(rows){
   $('results').innerHTML = h;
 }
 
-$('search-form').onsubmit = e => { e.preventDefault(); doSearch(); };
+// A new search always restarts at page 1. (gotoPage sets `page` for the
+// active result set; if we didn't reset it here, a fresh query submitted
+// while sitting on, say, page 3 would fetch offset (3-1)*limit and show the
+// middle of the new result set instead of its top.)
+$('search-form').onsubmit = e => { e.preventDefault(); page = 1; doSearch(); };
 health(); loadFacets();
 $('q').focus();
 """
