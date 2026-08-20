@@ -9,5 +9,6 @@
   "llm_max_ctx": 4096,
   "llm_disable": false,
   "max_results": 25,
-  "ignored_names": [".", "~$", ".tmp", ".swp", "Thumbs.db", ".DS_Store"]
+  "ignored_names": [".", "~$", ".tmp", ".swp", "Thumbs.db", ".DS_Store"],
+  "ignored_suffixes": [".sha1", ".sha128", ".sha256", ".sha512", ".md5"]
 }

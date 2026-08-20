@@ -55,11 +55,16 @@ def _row_from_file(root, relpath, st):
 def iter_files(cfg):
     """Yield (relpath, stat_result) for every file under data_dir that is not ignored."""
     ignored = set(cfg["ignored_names"])
+    # suffix-based skips (case-insensitive): checksum sidecars like
+    # foo.zip.sha256 / foo.rpm.sha128 must not pollute the index
+    ignored_suffixes = tuple(s.lower() for s in cfg.get("ignored_suffixes", ()))
     data_dir = cfg["data_dir"]
     for dirpath, dirnames, filenames in os.walk(data_dir):
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         for fn in filenames:
             if any(fn.startswith(p) for p in ignored):
+                continue
+            if ignored_suffixes and fn.lower().endswith(ignored_suffixes):
                 continue
             full = os.path.join(dirpath, fn)
             try:

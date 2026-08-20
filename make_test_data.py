@@ -72,6 +72,12 @@ FILES = [
     "isos/windows-server-2022-standard-x64.iso",
     "isos/esxi-8.0-update-1.iso",
     "isos/windows11-24h2-eu-x64.iso",
+    # --- checksum sidecars (must be excluded from the index) ---
+    "Software_Library/Admin_Software/dell/dell-bios-r740-x4.4.4-a01.zip.sha256",
+    "repos/RHEL9/packages/x86_64/nvidia-driver/nvidia-driver-535.183.01-1.el9.x86_64.rpm.sha128",
+    "isos/rhel-9.4-x86_64-dvd.iso.sha256",
+    "Software_Library/Drivers/linux/source/linux-firmware-20231205.tar.gz.sha1",
+    "Software_Library/Admin_Software/lenovo/lenovo-bios-t14-gen3-mncn25ww.zip.md5",
 ]
 
 

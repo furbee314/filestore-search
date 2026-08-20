@@ -140,6 +140,21 @@ assert any("r740" in n for n in top[:2]), \
 print("re-ranker includes OR terms: OK")
 
 # ---------------------------------------------------------------------------
+# checksum sidecars (.sha128/.sha256/...) must never enter the index
+# ---------------------------------------------------------------------------
+leaked = con.execute(
+    "SELECT COUNT(*) FROM files WHERE path LIKE '%.sha1' "
+    "OR path LIKE '%.sha256' OR path LIKE '%.sha128' "
+    "OR path LIKE '%.sha512' OR path LIKE '%.md5'").fetchone()[0]
+assert leaked == 0, f"checksum sidecars leaked into the index: {leaked}"
+total_no_sidecars = total_all
+on_disk = sum(len(fs) for _, _, fs in os.walk(os.path.join(HERE, "data")))
+assert total_no_sidecars < on_disk, \
+    "expected sidecars on disk but none indexed (is the exclusion a no-op?)"
+print(f"checksum sidecars excluded "
+      f"({on_disk} on disk, {total_no_sidecars} indexed): OK")
+
+# ---------------------------------------------------------------------------
 # 1+2. app-level: rewrite cache + guardrails, with a stubbed flaky LLM
 # ---------------------------------------------------------------------------
 print("\n== rewrite cache + guardrails (stubbed LLM) ==")

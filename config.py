@@ -82,5 +82,9 @@ def load_config():
         max_results=int(pick("max_results", "FILESTORE_SEARCH_MAX_RESULTS", 25)),
         # files to skip (dotfiles, temp files)
         ignored_names=tuple(file_cfg.get("ignored_names", [".*", "~$", ".tmp"])),
+        # suffixes to skip (case-insensitive): checksum sidecars live next to
+        # the files they describe and would otherwise pollute the index
+        ignored_suffixes=tuple(file_cfg.get(
+            "ignored_suffixes", [".sha1", ".sha128", ".sha256", ".sha512", ".md5"])),
     )
     return cfg

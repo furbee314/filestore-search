@@ -200,6 +200,7 @@ python3 test_e2e.py && python3 test_download.py && python3 test_robust.py
    | `llm_disable` | `FILESTORE_SEARCH_LLM_DISABLE` | `true` = pure FTS mode, no LLM calls at all. |
    | `max_results` | `FILESTORE_SEARCH_MAX_RESULTS` | cap on results returned per search. |
    | `ignored_names` | — | filename prefixes to skip while indexing. |
+   | `ignored_suffixes` | — | filename suffixes to skip while indexing (case-insensitive). Defaults cover the common checksum sidecars: `.sha1 .sha128 .sha256 .sha512 .md5`. |
 
    Example for this box:
 
@@ -215,7 +216,8 @@ python3 test_e2e.py && python3 test_download.py && python3 test_robust.py
      "llm_max_ctx": 4096,
      "llm_disable": false,
      "max_results": 25,
-     "ignored_names": [".", "~$", ".tmp", ".swp", "Thumbs.db", ".DS_Store"]
+     "ignored_names": [".", "~$", ".tmp", ".swp", "Thumbs.db", ".DS_Store"],
+     "ignored_suffixes": [".sha1", ".sha128", ".sha256", ".sha512", ".md5"]
    }
    ```
 
