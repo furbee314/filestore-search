@@ -1,8 +1,10 @@
 """Client for a locally-hosted LLM service (OpenAI-compatible chat endpoint).
 
 The LLM is used for two things:
-  1. rewrite_query()  - turn natural language into a tightened FTS5 query
-                        plus optional structured filters (category/platform).
+  1. rewrite_query()  - turn natural language into a tightened structured
+                        query: AND terms ("query"), an OR group ("any_of")
+                        for 'X or Y' requests, plus optional structured
+                        filters (category/platform/version/since).
   2. answer()         - generate a natural-language answer over the top search
                         results, so a user can ask "which firmware do I need
                         for my Dell R740 with 4410 CPU?" and get a concise
@@ -17,6 +19,7 @@ forwarded to Ollama as options.num_ctx so the KV cache stays small; lower it
 (e.g. 2048) on machines with less RAM.
 """
 import json
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -29,8 +32,12 @@ search over a software / firmware / driver file store.
 
 Return ONLY a JSON object with these keys (no prose, no markdown fences):
 {
-  "query": "the keyword query to run full-text search; include product, vendor,
-            version and keywords; omit fill words like 'the'/'please'/'find'",
+  "query": "AND terms: every result file must contain these words — put the
+            product, vendor, model number and version here; omit fill words
+            like 'the'/'please'/'find'",
+  "any_of": "null, or a list of 1-4 alternative words from an 'X or Y'
+            request. A result matches when it has ANY one of these; every
+            word in 'query' is still required.",
   "category": one of [linux-rpm, linux-deb, linux-source, windows-msi,
             windows-exe, windows-driver, windows-other, firmware, driver,
             iso, generic, null],
@@ -43,6 +50,13 @@ Return ONLY a JSON object with these keys (no prose, no markdown fences):
 }
 
 Rules:
+- If the user asks for alternatives — "A or B" (e.g. "bios or firmware for
+  my Dell R740") — put the alternatives in "any_of" and keep only the
+  shared requirements (product, vendor, model) in "query". Example:
+  "bios or firmware for my Dell R740" -> query "Dell R740", any_of
+  ["bios", "firmware"].
+- If the request contains no "or"/alternatives, set "any_of" to null and
+  put all the keywords in "query".
 - If the user clearly wants a specific OS platform, set platform.
 - Set category when the user mentions rpm/deb/windows/firmware/driver/etc.
 - Put concrete identifiers (product model numbers, versions, part numbers)
@@ -105,12 +119,19 @@ class LLMClient:
         self._last_ok_time = 0
 
     # -- low level ---------------------------------------------------------
-    def _post(self, payload, timeout=None):
+    def _post(self, payload, timeout=None, seed=None):
         url = self.base_url + "/chat/completions"
+        payload = dict(payload)
         if self._is_ollama:
-            # keep the context window explicit so CPU RAM usage is bounded
-            payload = dict(payload)
-            payload["options"] = {"num_ctx": self.max_ctx}
+            # keep the context window explicit so CPU RAM usage is bounded;
+            # seed pins sampling so the same prompt gives the same answer
+            options = {"num_ctx": self.max_ctx}
+            if seed is not None:
+                options["seed"] = seed
+            payload["options"] = options
+        elif seed is not None:
+            # OpenAI-compatible servers (vLLM, LM Studio, ...) accept seed
+            payload["seed"] = seed
         data = json.dumps(payload).encode()
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -128,7 +149,7 @@ class LLMClient:
             raise RuntimeError(f"LLM unreachable: {e}")
 
     def _chat(self, system, user, temperature=0.2, max_tokens=512,
-              timeout=None):
+              timeout=None, seed=None):
         if not self.enabled:
             raise RuntimeError("LLM disabled")
         return self._post({
@@ -140,18 +161,43 @@ class LLMClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": False,
-        }, timeout=timeout)
+        }, timeout=timeout, seed=seed)
 
     # -- high level --------------------------------------------------------
     def rewrite_query(self, question, timeout=None):
-        """Return a dict: {query, category, platform, version, since} or None."""
+        """Return a dict: {query, any_of, category, platform, version, since}
+        or None.
+
+        ``query`` is the AND set (every word required); ``any_of`` (list or
+        None) holds alternatives from an 'X or Y' request — a result matches
+        on ANY of them, all other terms still required.
+        """
+        # seed=0 pins sampling: the same question gets the same rewrite,
+        # so repeated searches are reproducible (combined with the caller's
+        # rewrite cache in app.py). max_tokens is generous because
+        # reasoning models emit a preamble inside the content before the
+        # JSON (the extraction below tolerates it).
         content = self._chat(SYSTEM_REWRITE, question, temperature=0.0,
-                             max_tokens=200, timeout=timeout)
+                             max_tokens=1024, timeout=timeout, seed=0)
         obj = _extract_json(content)
         if not isinstance(obj, dict):
             return None
+        # any_of: accept a list of clean tokens; drop bad entries, cap the
+        # list, and normalize to None when empty/absent (old backends that
+        # don't know the key just return None here).
+        any_of = obj.get("any_of")
+        if isinstance(any_of, str):
+            any_of = any_of.split()
+        if isinstance(any_of, (list, tuple)):
+            any_of = [str(t).strip() for t in any_of
+                      if str(t).strip() and
+                      re.match(r"^[A-Za-z0-9][A-Za-z0-9.\-_]*$", str(t).strip())]
+            any_of = any_of[:4] or None
+        else:
+            any_of = None
         out = {
             "query": str(obj.get("query") or question).strip(),
+            "any_of": any_of,
             "category": obj.get("category") or None,
             "platform": obj.get("platform") or None,
             "version": obj.get("version") or None,

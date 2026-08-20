@@ -29,7 +29,9 @@ import os
 import re
 import sys
 import threading
+import time
 import urllib.parse
+from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import ThreadingMixIn
 
@@ -43,12 +45,60 @@ from llm import LLMClient
 RECENT_RE = re.compile(
     r"\b(latest|newest|recent|recently)\b", re.IGNORECASE)
 
+# A time phrase in the user's request: an explicit date, a recency word
+# ("last week", "since March"), or "this/past <period>". Used to decide
+# whether an LLM-inferred 'since' filter is worth honoring at all.
+_TIME_PHRASE_RE = re.compile(
+    r"\d{4}[-/.]\d{1,2}([-/.]\d{1,2})?"
+    r"|\b(?:last|past|within|since|recent|recently|today|yesterday)\b"
+    r"|\b(?:this|the|past|last)\s+(?:day|week|month|quarter|year)\b"
+    r"|\b(?:january|february|march|april|may|june|july|august|september|"
+    r"october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b",
+    re.IGNORECASE)
+
 STATE = {
     "cfg": None,
     "con": None,
     "llm": None,
     "lock": threading.Lock(),
 }
+
+# Rewrite cache: with sampling pinned (seed=0, temperature 0), a repeated
+# search can reuse the LLM's rewrite instead of re-running CPU inference.
+# The same question therefore always yields the same result set. Bounded
+# so long-running services don't grow unbounded.
+_REWRITE_CACHE = OrderedDict()
+_REWRITE_CACHE_LOCK = threading.Lock()
+_REWRITE_CACHE_MAX = 512
+
+
+def _rewrite_cache_get(key):
+    with _REWRITE_CACHE_LOCK:
+        if key in _REWRITE_CACHE:
+            _REWRITE_CACHE.move_to_end(key)
+            return _REWRITE_CACHE[key]
+    return None
+
+
+def _rewrite_cache_put(key, value):
+    with _REWRITE_CACHE_LOCK:
+        _REWRITE_CACHE[key] = value
+        _REWRITE_CACHE.move_to_end(key)
+        while len(_REWRITE_CACHE) > _REWRITE_CACHE_MAX:
+            _REWRITE_CACHE.popitem(last=False)
+
+
+def _append_tokens(query, tokens):
+    """Append any tokens not already present (case-insensitive, substring)."""
+    base = " ".join(query.split())
+    low = base.lower()
+    for t in tokens:
+        tl = t.lower()
+        if tl in low:
+            continue
+        low += " " + tl
+        base += " " + t
+    return base
 
 
 def init(cfg=None):
@@ -78,6 +128,7 @@ def do_search(q, category=None, platform=None, limit=25, offset=0,
     cat = category
     plat = platform
     ver = None
+    or_terms = None  # LLM 'X or Y' alternatives (any_of)
     since_ts = db.since_to_ts(since)
     off = max(0, int(offset))
     lim = max(1, int(limit))
@@ -86,19 +137,45 @@ def do_search(q, category=None, platform=None, limit=25, offset=0,
     since_ts_from_llm = None
 
     if llm.enabled:
-        try:
-            rr = llm.rewrite_query(q, timeout=min(45, llm.timeout))
-            if rr:
-                query = rr["query"] or q
-                cat = rr["category"] or cat
-                plat = rr["platform"] or plat
-                ver = rr["version"]
-                if rr.get("since"):
-                    since_ts_from_llm = db.since_to_ts(rr["since"])
-                used_llm = True
-                llm_meta = rr
-        except Exception as e:
-            llm_meta = {"error": str(e)}
+        # Rewrite cache: the same question reuses the LLM's rewrite instead
+        # of re-running CPU inference. Combined with pinned sampling
+        # (seed=0 / temperature 0) this makes repeated searches of the same
+        # question return the same result set every time.
+        cache_key = " ".join(re.split(r"\s+", q.lower().strip()))
+        rr = _rewrite_cache_get(cache_key)
+        if rr is None:
+            try:
+                rr = llm.rewrite_query(q, timeout=min(45, llm.timeout))
+            except Exception as e:
+                llm_meta = {"error": str(e)}
+            else:
+                _rewrite_cache_put(cache_key, rr)
+        if rr:
+            query = rr["query"] or q
+            cat = rr["category"] or cat
+            plat = rr["platform"] or plat
+            ver = rr["version"]
+            or_terms = rr.get("any_of")
+            if rr.get("since"):
+                since_ts_from_llm = db.since_to_ts(rr["since"])
+            used_llm = True
+            llm_meta = dict(rr)
+            # Guardrail 1: the rewriter may rephrase, but it must not drop
+            # concrete identifiers (model/part/version numbers) — those are
+            # what pin a search down to the right file. Anything it
+            # discarded is merged back into the keyword query (the version
+            # is also checked, since the LLM may move it into "version").
+            kept = db.recover_identifiers(q, query + (" " + ver if ver else ""))
+            if kept:
+                query = _append_tokens(query, kept)
+                llm_meta["dropped_identifiers"] = kept
+            # Guardrail 2: an LLM-inferred time window is only honored when
+            # the user actually expressed one ("since 2024-05-01", "last
+            # week"). A small model occasionally "infers" recency from
+            # phrasing, which can silently shrink or zero the result set.
+            if since_ts_from_llm is not None and not _TIME_PHRASE_RE.search(q):
+                since_ts_from_llm = None
+                llm_meta["since_ignored"] = "no time phrase in request"
 
     if since_ts_from_llm is not None and since_ts is None:
         since_ts = since_ts_from_llm
@@ -113,7 +190,8 @@ def do_search(q, category=None, platform=None, limit=25, offset=0,
             return db.search(st["con"], query, limit=lim, offset=off,
                              category=cat_, platform=plat_,
                              min_mtime=since_ts,
-                             sort="mtime" if recency_order else "relevance")
+                             sort="mtime" if recency_order else "relevance",
+                             or_terms=or_terms)
 
     def runr(cat_, plat_):
         with st["lock"]:
@@ -153,15 +231,17 @@ def do_search(q, category=None, platform=None, limit=25, offset=0,
         order = "mtime"
         kw_count = 0
         with st["lock"]:
-            kw_count = db.count_matches(st["con"], query, category=cat,
-                                        platform=plat, min_mtime=since_ts)
+            kw_count = db.count_matches(st["con"], query, or_terms,
+                                        category=cat, platform=plat,
+                                        min_mtime=since_ts)
         if kw_count:
             # keyword set is non-empty: page through it (loosening filters only
             # kicks in if the current page happens to come back empty)
             results, cat_eff, plat_eff = loosen(
                 lambda c, p: run(c, p, recency_order=True), cat, plat)
-            total = db.count_matches(st["con"], query, category=cat_eff,
-                                     platform=plat_eff, min_mtime=since_ts)
+            total = db.count_matches(st["con"], query, or_terms,
+                                     category=cat_eff, platform=plat_eff,
+                                     min_mtime=since_ts)
         else:
             # no keyword matches: fall back to store-wide most-recent files
             results, cat_eff, plat_eff = loosen(runr, cat, plat)
@@ -174,7 +254,7 @@ def do_search(q, category=None, platform=None, limit=25, offset=0,
         # wiped out the results, retry with progressively looser filters
         # rather than returning an empty page.
         results, cat_eff, plat_eff = loosen(lambda c, p: run(c, p), cat, plat)
-        total = db.count_matches(st["con"], query, category=cat_eff,
+        total = db.count_matches(st["con"], query, or_terms, category=cat_eff,
                                  platform=plat_eff, min_mtime=since_ts)
 
     answer = None

@@ -4,7 +4,8 @@ real LLM service.
 It implements POST /v1/chat/completions and returns deterministic canned
 responses based on the system prompt:
   - the "rewrite" system prompt -> a JSON rewrite with filters derived from
-    simple keyword matching (enough to exercise the pipeline)
+    simple keyword matching (enough to exercise the pipeline, including an
+    any_of OR group for 'X or Y' requests)
   - the "answer" system prompt  -> a short natural-language answer quoting
     the top files from the user message
 
@@ -19,8 +20,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 def rewrite_reply(user_msg):
     m = user_msg.lower()
-    out = {"query": user_msg.strip(), "category": None, "platform": None,
-           "version": None, "since": None}
+    out = {"query": user_msg.strip(), "any_of": None, "category": None,
+           "platform": None, "version": None, "since": None}
     # category
     for kw, cat in (("rpm", "linux-rpm"), ("deb", "linux-deb"), ("msi", "windows-msi"),
                     ("iso", "iso"), ("install media", "iso"),
@@ -44,10 +45,31 @@ def rewrite_reply(user_msg):
     sd = re.findall(r"\b(\d{4}-\d{2}-\d{2})\b", m)
     if sd:
         out["since"] = sd[0]
+    # 'X or Y' / 'X or Y or Z': move the alternatives into any_of and out of
+    # the AND query (a result must match one of them, not all of them).
+    # The alternatives are the single word immediately before "or" and the
+    # single word immediately after it.
+    m_or = re.search(r"\s+(?:or|/)\s+", m)
+    if m_or:
+        words = lambda s: [w for w in re.findall(r"[a-z0-9.\-]+", s)
+                           if w not in ("for", "my", "the", "a", "an",
+                                        "with", "find", "please", "need",
+                                        "want", "me", "or")]
+        left, right = words(m[:m_or.start()]), words(m[m_or.end():])
+        alts = []
+        if left:
+            alts.append(left[-1])
+        if right:
+            alts.append(right[0])
+        out["any_of"] = alts or None
     # tighten query: drop filler AND recency words (recency is handled by
-    # the store's ordering / since filter, not by full-text matching)
-    q = re.sub(r"\b(for|my|the|a|an|please|find|me|need|want|get|install|"
+    # the store's ordering / since filter, not by full-text matching), and
+    # drop the any_of alternatives (they live in their own OR group)
+    q = re.sub(r"\b(for|my|the|a|an|please|find|me|or|need|want|get|install|"
                r"latest|newest|recent|recently|new)\b", " ", m)
+    if out["any_of"]:
+        for alt in out["any_of"]:
+            q = re.sub(r"\b" + re.escape(alt.lower()) + r"\b", " ", q)
     q = re.sub(r"\s+", " ", q).strip()
     out["query"] = q or user_msg.strip()
     return json.dumps(out)

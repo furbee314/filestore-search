@@ -1,7 +1,11 @@
 # File Store Search - web service
 # Install: copy to /etc/systemd/system/filestore-search.service
 #   1) adjust WorkingDirectory / User / ExecStart paths
-#   2) systemctl daemon-reload && systemctl enable --now filestore-search
+#   2) create /etc/filestore-search/llm.env (chmod 600) with the LLM
+#      credentials, e.g. for SGLang:
+#        FILESTORE_SEARCH_LLM_API_KEY=***
+#      (never commit the key to this repo)
+#   3) systemctl daemon-reload && systemctl enable --now filestore-search
 #
 # To run behind your existing nginx (recommended; nginx already serves
 # downloads), proxy / to this port and point search links at nginx's
@@ -22,15 +26,21 @@ Environment=FILESTORE_SEARCH_ROOT=/opt/filestore-search
 Environment=FILESTORE_SEARCH_DATA=/mnt
 Environment=FILESTORE_SEARCH_DB=/var/lib/filestore-search/search.db
 # your local LLM service (OpenAI-compatible /v1/chat/completions)
-# Default here: Ollama on this host, CPU, serving a 3B instruct model
-# (install: see ollama.service). Other options:
+# Default here: SGLang serving a 27B reasoning model (qwen3.8-27b),
+# which needs a Bearer API key (via the env file above) and a longer
+# inference timeout than a small CPU model.
+# Alternatives:
 # Ollama:    http://127.0.0.1:11434/v1  model e.g. qwen2.5:3b-instruct
+#           (no API key needed; drop the FILESTORE_SEARCH_LLM_API_KEY
+#           line from the env file and lower the timeout)
 # vLLM:      http://127.0.0.1:8000/v1   model = --served-model-name
 # tgi-webui: its OpenAI-compatible URL  model name + FILESTORE_SEARCH_LLM_API_KEY
-# CPU boxes: keep the model small (3-7B 4-bit) and raise
-# FILESTORE_SEARCH_LLM_TIMEOUT (default 60s) if inference is slow.
-Environment=FILESTORE_SEARCH_LLM_BASE=http://127.0.0.1:11434/v1
-Environment=FILESTORE_SEARCH_LLM_MODEL=qwen2.5:3b-instruct
+Environment=FILESTORE_SEARCH_LLM_BASE=http://spark-633e:30000/v1
+Environment=FILESTORE_SEARCH_LLM_MODEL=qwen3.8-27b
+# reasoning models emit a thinking preamble before the JSON answer;
+# give inference enough headroom
+Environment=FILESTORE_SEARCH_LLM_TIMEOUT=90
+EnvironmentFile=-/etc/filestore-search/llm.env
 Environment=FILESTORE_SEARCH_PORT=8080
 ExecStart=/usr/bin/python3 /opt/filestore-search/app.py --host 127.0.0.1 --port 8080
 Restart=on-failure
