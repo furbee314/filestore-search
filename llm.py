@@ -4,7 +4,11 @@ The LLM is used for two things:
   1. rewrite_query()  - turn natural language into a tightened structured
                         query: AND terms ("query"), an OR group ("any_of")
                         for 'X or Y' requests, plus optional structured
-                        filters (category/platform/version/since).
+                        filters (category/platform/version). It is NOT
+                        asked for dates: time windows ("this month",
+                        "last 30 days") are resolved by the server from
+                        the system clock, because a local model has no
+                        reliable current date and would hallucinate one.
   2. answer()         - generate a natural-language answer over the top search
                         results, so a user can ask "which firmware do I need
                         for my Dell R740 with 4410 CPU?" and get a concise
@@ -44,9 +48,11 @@ Return ONLY a JSON object with these keys (no prose, no markdown fences):
   "platform": one of [rhel, sles, opensuse, ubuntu, debian, linux, windows,
             firmware, unknown, null],
   "version": "a specific version if the user named one, else null",
-  "since": "ISO date (YYYY-MM-DD) for 'files from <date> onward' requests,
-            e.g. 'since last week', 'updated in March'; null when the user
-            has no time window"
+  "since": "an explicit ISO date (YYYY-MM-DD) ONLY when the user typed that
+            exact date in their request, copied verbatim. Do NOT compute or
+            guess dates from relative phrases ('last week', 'this month',
+            'since March') — the server resolves those with the real system
+            clock. If the user typed no explicit date, set null."
 }
 
 Rules:
@@ -65,7 +71,10 @@ Rules:
 - Recency words ("latest", "newest", "recent", "added/updated since <date>")
   are handled by the store's sort/ordering: keep "query" to the actual
   file/product keywords only and do NOT put words like "latest" or "newest"
-  into it. If the user names an explicit time window, set "since".
+  into it. Set "since" ONLY for an explicit date the user typed verbatim;
+  never compute or guess a date from relative phrases ("last week", "this
+  month", "since March") — set "since" to null for those; the server
+  resolves them from the system clock.
 - The output must be one single valid JSON object: every key and every
   string value in double quotes; null (lowercase, unquoted) for missing.
 """
@@ -208,6 +217,12 @@ class LLMClient:
             out["category"] = None
         if out["platform"] and out["platform"] not in _VALID_PLATFORMS:
             out["platform"] = None
+        # 'since' is advisory only (the server resolves time windows from the
+        # system clock and discards this value); keep a malformed one from
+        # even surviving to the logs
+        if out["since"] and not re.match(
+                r"^\d{4}-\d{2}-\d{2}$", str(out["since"])):
+            out["since"] = None
         return out if out["query"] else None
 
     def answer(self, question, results, timeout=None):

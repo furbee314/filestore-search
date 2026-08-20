@@ -10,6 +10,7 @@ Run:
 import os
 import sys
 import tempfile
+from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -197,6 +198,7 @@ class StubLLM:
     enabled = True
     timeout = 5
     rewrite_query: Optional[Callable[..., Any]]
+    cache_key_prefix = ""
 
     def __init__(self):
         self.rewrite_query = None
@@ -286,17 +288,178 @@ assert d["total"] == full, \
     f"ignored-since total {d['total']} != full total {full}"
 print(f"guardrail: hallucinated since=2099 ignored, total intact ({full}): OK")
 
-# 2c. ...but an explicit time phrase in the user request IS honored
+# 2c. ...but an explicit time phrase in the user request IS honored —
+# resolved from the system clock, not the LLM (clean rewriter here so no
+# LLM-invented since is in the mix)
+app._REWRITE_CACHE.clear()
+
+
+class CleanRewriter:
+    def rewrite_query(self, q, timeout=None):
+        return {"query": "dell bios", "category": None, "platform": None,
+                "version": None, "since": None}
+
+
+app.STATE["llm"].rewrite_query = CleanRewriter().rewrite_query
 d = app.do_search("dell bios since 2099-01-01", limit=5)
 assert d["total"] == 0, \
     f"explicit 'since 2099-01-01' should zero the set, got total={d['total']}"
-assert "since_ignored" not in (d["llm_meta"] or {})
-print("guardrail: explicit time phrase honored (total=0 for since 2099): OK")
+assert d["since"] == "2099-01-01", f"since not surfaced: {d.get('since')}"
+print("guardrail: explicit time phrase honored via system clock: OK")
 
 # 2d. db-level identifier recovery
 assert db.recover_identifiers("dell r740 with 6230 cpu", "dell bios") \
     == ["r740", "6230"]
 assert db.recover_identifiers("dell r740", "dell r740 bios") == []
 print("recover_identifiers unit cases: OK")
+
+# ---------------------------------------------------------------------------
+# 5. time phrases: resolved from the SYSTEM clock, never the LLM
+# ---------------------------------------------------------------------------
+print("\n== time phrases (system clock) ==")
+N0 = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)  # Wednesday
+rp = lambda s: db.resolve_time_phrase(s, now=N0)
+
+assert rp("since 2024-05-01") == "2024-05-01"
+assert rp("updated on 2024-05-01") == "2024-05-01"
+assert rp("bios 2024.05.01") == "2024-05-01"
+assert rp("last 30 days") == "2026-07-20"
+assert rp("past 3 months") == "2026-05-19"
+assert rp("last 2 years") == "2024-08-19"
+assert rp("last week") == "2026-08-12"
+assert rp("this week") == "2026-08-17"          # Monday
+assert rp("this month") == "2026-08-01"
+assert rp("last month") == "2026-07-01"
+assert rp("this quarter") == "2026-07-01"
+assert rp("last quarter") == "2026-04-01"
+assert rp("this year") == "2026-01-01"
+assert rp("last year") == "2025-01-01"
+assert rp("today") == "2026-08-19"
+assert rp("yesterday") == "2026-08-18"
+assert rp("since March") == "2026-03-01"
+assert rp("updated in June 2023") == "2023-06-01"
+assert rp("firmware from january") is None      # bare month needs in/since
+assert rp("dell r740 bios") is None             # no time phrase
+assert rp("the latest update") is None          # recency word, no window
+print("resolve_time_phrase unit cases: OK")
+
+# month/year arithmetic edges
+assert db.resolve_time_phrase("last month",
+                              now=datetime(2026, 3, 1, tzinfo=timezone.utc)) \
+    == "2026-02-01"
+assert db.resolve_time_phrase("last 2 months",
+                              now=datetime(2026, 1, 31, tzinfo=timezone.utc)) \
+    == "2025-11-30"
+assert db.resolve_time_phrase("last month",
+                              now=datetime(2026, 1, 15, tzinfo=timezone.utc)) \
+    == "2025-12-01"
+assert db.resolve_time_phrase("since July",
+                              now=datetime(2026, 3, 1, tzinfo=timezone.utc)) \
+    == "2025-07-01"                            # future month -> previous year
+assert db.resolve_time_phrase("last month",
+                              now=datetime(2026, 3, 31, tzinfo=timezone.utc)) \
+    == "2026-02-01"
+print("month/year edges: OK")
+
+# End-to-end: two synthetic files, one this month, one old (400 days back)
+now = datetime.now(timezone.utc)
+# fresh_ts: the 2nd of this month — always inside "this month" and
+# "last 30 days", and always more than 7 days old (so outside "last
+# week"), regardless of what day today is.
+fresh_ts = now.replace(day=2).timestamp()
+old_ts = now.timestamp() - 400 * 86400
+tt_dir = os.path.join(CFG["data_dir"], "_timetest")
+os.makedirs(tt_dir, exist_ok=True)
+tt_fresh = os.path.join(tt_dir, "timetest-fresh-9.9.9-1.x86_64.rpm")
+tt_old = os.path.join(tt_dir, "timetest-old-1.0.0-1.x86_64.rpm")
+for p, ts in ((tt_fresh, fresh_ts), (tt_old, old_ts)):
+    with open(p, "wb") as f:
+        f.write(b"x")
+    os.utime(p, (ts, ts))
+db.full_reindex(CFG, con, quiet=True)
+full = db.count_matches(con, "timetest")
+assert full == 2, f"expected 2 timetest files, got {full}"
+assert db.count_matches(con, "timetest",
+                        min_mtime=db.since_to_ts(
+                            db.resolve_time_phrase("this month"))) == 1, \
+    "test setup: fresh file must fall inside 'this month'"
+assert db.count_matches(con, "timetest",
+                        min_mtime=db.since_to_ts(
+                            db.resolve_time_phrase("last 30 days"))) == 1, \
+    "test setup: fresh file must fall inside 'last 30 days'"
+assert db.count_matches(con, "timetest",
+                        min_mtime=db.since_to_ts(
+                            db.resolve_time_phrase("last week"))) == 0, \
+    "test setup: no timetest file may fall inside 'last week'"
+
+
+class LLMDateLiar:
+    """Simulates the bug: the model invents a wrong 'since' date."""
+    def rewrite_query(self, q, timeout=None):
+        return {"query": "timetest", "category": None, "platform": None,
+                "version": None, "since": "2099-01-01"}
+
+
+app.STATE["llm"].rewrite_query = LLMDateLiar().rewrite_query
+app._REWRITE_CACHE.clear()
+
+# 5a. "this month" -> system-clock window; the LLM's bogus 2099 date must
+#     NOT be what filters the results
+d = app.do_search("timetest this month", limit=5)
+assert d["total"] == 1, \
+    f"'this month' should return only the fresh file, total={d['total']}"
+assert d["since"] and d["since"].startswith(now.strftime("%Y-%m") + "-01"), \
+    f"since should be start of this month, got {d['since']}"
+assert d["results"][0]["name"].startswith("timetest-fresh")
+assert "since_ignored" in (d["llm_meta"] or {}), \
+    f"LLM-invented date should be flagged: {d['llm_meta']}"
+print(f"e2e: 'this month' -> system clock ({d['since']}), "
+      f"LLM-invented date ignored: OK")
+
+# 5b. "last 30 days" -> window of 30 days
+d = app.do_search("timetest last 30 days", limit=5)
+assert d["total"] == 1, f"'last 30 days' total={d['total']}"
+assert d["results"][0]["name"].startswith("timetest-fresh")
+print("e2e: 'last 30 days' -> fresh file only: OK")
+
+# 5c. no time phrase -> LLM date ignored, full set returned
+app._REWRITE_CACHE.clear()
+d = app.do_search("find the timetest package", limit=5)
+assert d["total"] == full, \
+    f"no time phrase: LLM date must not shrink the set, total={d['total']}"
+print("e2e: no time phrase -> LLM date ignored, full set: OK")
+
+# 5d. explicit date typed by the user still works (verbatim, no clock math)
+app._REWRITE_CACHE.clear()
+d = app.do_search("timetest since 2020-01-01", limit=5)
+assert d["total"] == full, \
+    f"'since 2020-01-01' should keep both files, total={d['total']}"
+print("e2e: explicit user date honored: OK")
+
+# 5e. empty window (nothing fresh enough) -> widened to most recent matches,
+#     with an explanatory flag instead of a silent empty page
+d = app.do_search("timetest last week", limit=5)
+assert d["total"] == full, \
+    f"'last week' found nothing; window should widen, total={d['total']}"
+assert "window_widened" in (d["llm_meta"] or {}), \
+    f"widening should be flagged: {d['llm_meta']}"
+assert not d.get("since"), \
+    f"widened window should not report a since filter: {d.get('since')}"
+print("e2e: empty window widened with flag: OK")
+
+# 5f. ...but a strict user-typed future date is NOT widened
+app._REWRITE_CACHE.clear()
+d = app.do_search("timetest since 2099-01-01", limit=5)
+assert d["total"] == 0, \
+    f"strict 'since 2099-01-01' must stay zero, got total={d['total']}"
+assert "window_widened" not in (d["llm_meta"] or {}), \
+    f"strict filter must not be widened: {d['llm_meta']}"
+print("e2e: strict user date not widened: OK")
+
+# cleanup: remove the synthetic files and reindex
+for p in (tt_fresh, tt_old):
+    os.unlink(p)
+os.rmdir(tt_dir)
+db.full_reindex(CFG, con, quiet=True)
 
 print("\nALL OK")

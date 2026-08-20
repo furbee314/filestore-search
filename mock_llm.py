@@ -41,7 +41,11 @@ def rewrite_reply(user_msg):
     v = re.findall(r"\b(\d+(?:\.\d+)+[a-z0-9]*)\b", m)
     if v:
         out["version"] = v[-1]
-    # since: an explicit ISO date (YYYY-MM-DD) anywhere in the request
+    # since: an explicit ISO date the user typed, verbatim. (In practice the
+    # real model is told to leave 'since' null for anything relative; the
+    # server resolves time windows from the system clock and discards any
+    # date the model invents. The mock echoes user-typed dates so the
+    # pipeline still exercises a well-behaved LLM.)
     sd = re.findall(r"\b(\d{4}-\d{2}-\d{2})\b", m)
     if sd:
         out["since"] = sd[0]

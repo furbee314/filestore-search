@@ -32,6 +32,7 @@ import threading
 import time
 import urllib.parse
 from collections import OrderedDict
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import ThreadingMixIn
 
@@ -44,17 +45,6 @@ from llm import LLMClient
 # most-recently-modified ordering instead of relevance.
 RECENT_RE = re.compile(
     r"\b(latest|newest|recent|recently)\b", re.IGNORECASE)
-
-# A time phrase in the user's request: an explicit date, a recency word
-# ("last week", "since March"), or "this/past <period>". Used to decide
-# whether an LLM-inferred 'since' filter is worth honoring at all.
-_TIME_PHRASE_RE = re.compile(
-    r"\d{4}[-/.]\d{1,2}([-/.]\d{1,2})?"
-    r"|\b(?:last|past|within|since|recent|recently|today|yesterday)\b"
-    r"|\b(?:this|the|past|last)\s+(?:day|week|month|quarter|year)\b"
-    r"|\b(?:january|february|march|april|may|june|july|august|september|"
-    r"october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)\b",
-    re.IGNORECASE)
 
 STATE = {
     "cfg": None,
@@ -132,16 +122,26 @@ def do_search(q, category=None, platform=None, limit=25, offset=0,
     since_ts = db.since_to_ts(since)
     off = max(0, int(offset))
     lim = max(1, int(limit))
-    # recency can also come from the LLM's rewrite (a real LLM may set the
-    # 'since' filter when the user names a time window)
-    since_ts_from_llm = None
+    # Time phrases are resolved from the SYSTEM clock, never the LLM: the
+    # LLM has no reliable current date and hallucinates one for relative
+    # phrases ("this month", "last week"). An explicit ?since= parameter
+    # always wins; otherwise a time phrase in the user's request is
+    # resolved deterministically against the local clock.
+    since_resolved = None
 
     if llm.enabled:
         # Rewrite cache: the same question reuses the LLM's rewrite instead
         # of re-running CPU inference. Combined with pinned sampling
         # (seed=0 / temperature 0) this makes repeated searches of the same
-        # question return the same result set every time.
-        cache_key = " ".join(re.split(r"\s+", q.lower().strip()))
+        # question return the same result set every time. The key includes
+        # today's local date so a time-phrased query ("this month", "last
+        # week") is re-rewritten when the day rolls over and its window
+        # slides. A stub LLM can prepend a per-check prefix to its cache key
+        # so each test section starts from a cold cache (real clients use
+        # the bare question).
+        cache_key = " ".join(re.split(r"\s+", q.lower().strip())) + \
+            " @ " + datetime.now().strftime("%Y-%m-%d") + \
+            getattr(llm, "cache_key_prefix", "")
         rr = _rewrite_cache_get(cache_key)
         if rr is None:
             try:
@@ -156,11 +156,17 @@ def do_search(q, category=None, platform=None, limit=25, offset=0,
             plat = rr["platform"] or plat
             ver = rr["version"]
             or_terms = rr.get("any_of")
-            if rr.get("since"):
-                since_ts_from_llm = db.since_to_ts(rr["since"])
-            used_llm = True
+            # Never trust an LLM-invented 'since' date: the model has no
+            # reliable current date and hallucinates one for relative
+            # phrases. Any since value it emits is discarded — time windows
+            # come from the user's ?since= param or the system-clock
+            # resolution of the phrase below.
             llm_meta = dict(rr)
-            # Guardrail 1: the rewriter may rephrase, but it must not drop
+            if rr.get("since"):
+                llm_meta["since_ignored"] = \
+                    "LLM-invented date; resolved from system clock instead"
+            used_llm = True
+            # Guardrail: the rewriter may rephrase, but it must not drop
             # concrete identifiers (model/part/version numbers) — those are
             # what pin a search down to the right file. Anything it
             # discarded is merged back into the keyword query (the version
@@ -169,16 +175,22 @@ def do_search(q, category=None, platform=None, limit=25, offset=0,
             if kept:
                 query = _append_tokens(query, kept)
                 llm_meta["dropped_identifiers"] = kept
-            # Guardrail 2: an LLM-inferred time window is only honored when
-            # the user actually expressed one ("since 2024-05-01", "last
-            # week"). A small model occasionally "infers" recency from
-            # phrasing, which can silently shrink or zero the result set.
-            if since_ts_from_llm is not None and not _TIME_PHRASE_RE.search(q):
-                since_ts_from_llm = None
-                llm_meta["since_ignored"] = "no time phrase in request"
 
-    if since_ts_from_llm is not None and since_ts is None:
-        since_ts = since_ts_from_llm
+    # Time window, in priority order: an explicit ?since= param (user-typed
+    # date) beats a time phrase in the request resolved against the SYSTEM
+    # clock (never the LLM, which can't be trusted with the current date).
+    # A literal date in the request ("since 2024-05-01") is a strict filter
+    # the user asked for; a relative phrase ("this month", "last week") is
+    # a soft window that may be widened when it matches nothing.
+    q_has_literal_date = bool(re.search(
+        r"\b\d{4}[-/.]\d{1,2}([-/.]\d{1,2})?\b", q or "") or
+        re.search(r"\b\d{1,2}[-/.]\d{1,2}[-/.]\d{4}\b", q or ""))
+    if since_ts is None and q:
+        since_resolved = db.resolve_time_phrase(q)
+        if since_resolved:
+            since_ts = db.since_to_ts(since_resolved)
+    since_window_relative = (since_ts is not None and since_resolved
+                             and not since and not q_has_literal_date)
 
     # version filter: if the LLM (or the user via ?version=) named one, bias
     # results to it by appending the version token to the query
@@ -227,6 +239,27 @@ def do_search(q, category=None, platform=None, limit=25, offset=0,
     # at least one member; a bare "latest" (no real keywords) falls back to the
     # store-wide most-recent files instead.
     cat_eff = plat_eff = None
+    # An empty time window is a soft filter: when a relative phrase resolved
+    # from the system clock ("this month", "last week") empties the keyword
+    # set — the store simply has nothing that fresh — fall back to the most
+    # recent matching files overall rather than an empty page, and tell the
+    # caller so it can explain the window was widened. Strict filters (an
+    # ?since= param, or a literal date typed in the request) are never
+    # widened. (q_has_literal_date above is the guard: version numbers like
+    # "24.04" don't match the literal-date patterns, so this can't
+    # false-positive on them.)
+    if since_window_relative:
+        with st["lock"]:
+            kw_any = db.count_matches(st["con"], query, or_terms,
+                                      category=cat, platform=plat,
+                                      min_mtime=since_ts)
+        if not kw_any:
+            since_ts = None
+            since_resolved = None
+            llm_meta = llm_meta or {}
+            llm_meta["window_widened"] = \
+                "no files in that window; showing most recent matches"
+
     if recency:
         order = "mtime"
         kw_count = 0
@@ -281,7 +314,7 @@ def do_search(q, category=None, platform=None, limit=25, offset=0,
         "limit": lim,
         "pages": pages,
         "sort": order,
-        "since": since,
+        "since": since or since_resolved,
     }
 
 
@@ -652,6 +685,8 @@ function renderMeta(d){
   h += ` for &#8220;${esc(d.query)}&#8221;`;
   if(d.sort==='mtime') h += ` &middot; <span class="rw">sorted newest first</span>`;
   if(d.since) h += ` &middot; modified since ${esc(d.since)}`;
+  if(d.llm_meta && d.llm_meta.window_widened)
+    h += ` &middot; <span class="rw">${esc(d.llm_meta.window_widened)}</span>`;
   if(d.rewritten_query && d.rewritten_query!==d.query)
     h += ` &middot; <span class="rw">searched as &#8220;${esc(d.rewritten_query)}&#8221;</span>`;
   $('meta').innerHTML = h;

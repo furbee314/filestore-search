@@ -1,9 +1,10 @@
 """SQLite storage layer: schema, upsert, incremental refresh, FTS5 search."""
+import calendar
 import os
 import re
 import sqlite3
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from indexer import (SCHEMA, SCHEMA_VERSION, classify, extract_version,
                      extract_vendor, extract_description, priority_for)
@@ -385,6 +386,144 @@ def since_to_ts(value):
         return dt.timestamp()
     except ValueError:
         return None
+
+
+_MONTHS = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "august": 8, "aug": 8, "september": 9, "sep": 9, "october": 10,
+    "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
+}
+_MONTH_WORDS = "|".join(sorted(_MONTHS, key=len, reverse=True))
+
+# Relative spans: "last/past/within/since [the] N <unit>" (also "in N <unit>")
+_SPAN_RE = re.compile(
+    r"\b(?:last|past|within|since|in)\s+(?:the\s+)?"
+    r"(\d{1,3})\s+(day|week|month|year|mo)s?\b", re.I)
+# Explicit relative-month name: "since March", "updated in June 2023"
+_REL_MONTH_RE = re.compile(
+    r"\b(?:in|since|updated\s+(?:in|since))\s+(" + _MONTH_WORDS + r")\b"
+    r"(?:\s+(\d{4}))?", re.I)
+# Bare month name as the whole phrase ("March", "Feb [year]") — same group
+# shape as _REL_MONTH_RE so both can be handled with one code path.
+_BARE_MONTH_RE = re.compile(
+    r"^\s*(" + _MONTH_WORDS + r")\s*(?:\s+(\d{4}))?\s*$", re.I)
+
+
+def resolve_time_phrase(request, now=None):
+    """Resolve a user time phrase to an ISO date the store can filter on.
+
+    Uses ONLY the system clock (``now``; default ``datetime.now(timezone.utc)``)
+    — never the LLM, which has no reliable current date and hallucinates one
+    for relative phrases ("this month", "last week"). Returns a "YYYY-MM-DD"
+    string (suitable for :func:`since_to_ts`) or None when the request
+    carries no resolvable time phrase.
+
+    Supported forms (first match in this order wins):
+      - explicit date the user typed: "2024-05-01" (any order, - . /)
+      - "last/past/within/since N <days|weeks|months|years>"  (incl. "in")
+      - "last/past/this <day|week|month|quarter|year>"
+      - "today" / "yesterday"
+      - "<month> [year]" after in/since, or as a bare phrase
+
+    Windows use start-of-period semantics: "this month" -> 1st of the
+    current month, "last week" -> 7 days back, "last year" -> Jan 1 last
+    year.
+    """
+    if not request:
+        return None
+    q = str(request).lower()
+    now = now or datetime.now(timezone.utc)
+    d0 = now.date()
+
+    # 1. explicit date typed by the user (copied verbatim, no clock math)
+    m = re.search(r"\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b", q)
+    if m:
+        month, day = int(m.group(2)), int(m.group(3))
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return f"{m.group(1)}-{month:02d}-{day:02d}"
+    m = re.search(r"\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})\b", q)
+    if m:
+        month, day = int(m.group(1)), int(m.group(2))
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return f"{m.group(3)}-{month:02d}-{day:02d}"
+
+    def days_ago(n):
+        return (d0 - timedelta(days=n)).isoformat()
+
+    # 2. "last/past/within/since N <unit>"
+    m = _SPAN_RE.search(q)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2).rstrip("s").lower()
+        if n <= 0:
+            n = 1
+        if unit == "day":
+            return days_ago(n)
+        if unit == "week":
+            return days_ago(7 * n)
+        if unit == "month":
+            return _months_back(d0, n).isoformat()
+        return _years_back(d0, n).isoformat()
+
+    # 3. "last/past/this <unit>"
+    m = re.search(
+        r"\b(this|last|past)\s+(day|week|month|quarter|year)\b", q)
+    if m:
+        word, unit = m.group(1), m.group(2)
+        if unit == "day":
+            # "today" / "this day" -> since start of today; "yesterday"/
+            # "last day" -> since start of yesterday
+            return d0.isoformat() if word in ("this", "today") else days_ago(1)
+        if unit == "week":
+            # "this week" -> since Monday; "last/past week" -> ~7 days back
+            monday = d0 - timedelta(days=d0.weekday())
+            return monday.isoformat() if word == "this" else days_ago(7)
+        if unit == "month":
+            if word == "this":
+                return d0.replace(day=1).isoformat()
+            return _months_back(d0, 1).replace(day=1).isoformat()
+        if unit == "quarter":
+            q_start_month = 3 * ((d0.month - 1) // 3) + 1
+            q_start = d0.replace(month=q_start_month, day=1)
+            if word == "this":
+                return q_start.isoformat()
+            return _months_back(q_start, 3).replace(day=1).isoformat()
+        if word == "this":
+            return f"{d0.year:04d}-01-01"
+        return f"{d0.year - 1:04d}-01-01"
+
+    # 4. today / yesterday
+    if re.search(r"\byesterday\b", q):
+        return days_ago(1)
+    if re.search(r"\btoday\b", q):
+        return d0.isoformat()
+
+    # 5. relative month: "since March", "updated in June 2023", bare "March"
+    m = _REL_MONTH_RE.search(q) or _BARE_MONTH_RE.match(q)
+    if m:
+        month = _MONTHS[m.group(1)]
+        year = int(m.group(2)) if m.group(2) else d0.year
+        if year == d0.year and month > d0.month:
+            year -= 1  # "since July" said in March means last July
+        return f"{year:04d}-{month:02d}-01"
+    return None
+
+
+def _months_back(d, n):
+    m = d.month - n
+    y = d.year + (m - 1) // 12
+    m = (m - 1) % 12 + 1
+    last = calendar.monthrange(y, m)[1]
+    return d.replace(year=y, month=m, day=min(d.day, last))
+
+
+def _years_back(d, n):
+    y = d.year - n
+    try:
+        return d.replace(year=y)
+    except ValueError:  # Feb 29 on a non-leap year
+        return d.replace(year=y, day=28)
 
 
 # Hard ceiling on how many candidate rows the re-ranker will consider in one

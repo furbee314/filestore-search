@@ -44,7 +44,9 @@ def main():
                           help="order results; 'newest' = most recently modified")
     p_search.add_argument("--since",
                           help="only files modified since this date "
-                               "(YYYY-MM-DD, ISO datetime, or epoch)")
+                               "(YYYY-MM-DD, ISO datetime, epoch, or a "
+                               "relative phrase like 'last week' / "
+                               "'this month' resolved from system time)")
     p_search.add_argument("--json", action="store_true")
 
     p_newest = sub.add_parser("newest",
@@ -55,7 +57,9 @@ def main():
     p_newest.add_argument("--platform")
     p_newest.add_argument("--since",
                           help="only files modified since this date "
-                               "(YYYY-MM-DD, ISO datetime, or epoch)")
+                               "(YYYY-MM-DD, ISO datetime, epoch, or a "
+                               "relative phrase like 'last week' / "
+                               "'this month' resolved from system time)")
     p_newest.add_argument("--json", action="store_true")
 
     sub.add_parser("llm-test")
@@ -100,7 +104,13 @@ def main():
     if args.cmd == "search":
         con = db.connect(cfg)
         q = " ".join(args.query)
-        since = db.since_to_ts(args.since)
+        # --since accepts a date OR a relative phrase ("last week", "this
+        # month") resolved from the system clock — same resolver the web
+        # app uses, so the LLM is never asked for the current date.
+        since_val = args.since
+        if since_val and db.since_to_ts(since_val) is None:
+            since_val = db.resolve_time_phrase(since_val)
+        since = db.since_to_ts(since_val)
         res = db.search(con, q, limit=args.limit,
                         category=args.category, platform=args.platform,
                         min_mtime=since,
@@ -117,14 +127,19 @@ def main():
 
     if args.cmd == "newest":
         con = db.connect(cfg)
-        since = db.since_to_ts(args.since)
+        # same --since contract as `search`: date or relative phrase
+        # (resolved from the system clock)
+        since_val = args.since
+        if since_val and db.since_to_ts(since_val) is None:
+            since_val = db.resolve_time_phrase(since_val)
+        since = db.since_to_ts(since_val)
         res = db.newest(con, args.limit, category=args.category,
                         platform=args.platform, min_mtime=since)
         if args.json:
             print(json.dumps(res, indent=2))
         else:
             print(f"most recent {len(res)} file(s) "
-                  f"{'since ' + args.since if args.since else ''}\n")
+                  f"{'since ' + (since_val or '') if since_val else ''}\n")
             for r in res:
                 m = datetime.datetime.fromtimestamp(
                     r["mtime"]).strftime("%Y-%m-%d %H:%M")

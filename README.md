@@ -259,7 +259,6 @@ python3 test_e2e.py && python3 test_download.py && python3 test_robust.py
      linux-installer, ...)
    - a `platform` filter (rhel, ubuntu, windows, ...)
    - an optional `version` token
-   - an optional `since` date when you ask for "files since <date>"
 3. SQLite FTS5 (OR-matched tokens, `bm25` ranking + a "more tokens matched
    = higher rank" re-rank) returns results; LIKE fallback catches very short
    queries. The re-rank also folds in a per-file **deliverable priority** so
@@ -268,7 +267,10 @@ python3 test_e2e.py && python3 test_download.py && python3 test_robust.py
    (`.txt`/`.pdf`/readmes) rank last, repo metadata/manifests
    (`repomd.xml`, `Packages.gz`, GPG keys) below, and archives in between.
    This is why "dell r740 bios" returns the BIOS file rather than a readme
-   that merely mentions it.
+   that merely mentions it. Time windows ("this month", "last 30 days",
+   "since March") are **not** part of the LLM rewrite — they are resolved
+   deterministically from the system clock (see Recency below), so the model
+   can never hallucinate a date.
 4. Optional `&answer=1`: the LLM writes a short plain-English answer naming
    the best file(s) and their download path, based only on the top results
    (it cannot invent files).
@@ -286,8 +288,19 @@ the indexer already stores. Three ways to use it:
 - **`&sort=newest`** — order the (keyword-matched) results by recency instead
   of relevance. This is the UI's "Sort: Newest first" dropdown.
 - **`&since=YYYY-MM-DD`** (or an ISO datetime / epoch) — restrict results to
-  files modified after that date. The LLM sets this automatically when you
-  name a time window.
+  files modified after that date.
+- **Time phrases in your query** — "this month", "last 30 days", "last week",
+  "since March", "updated in June 2023", "today"/"yesterday", or an explicit
+  date you type ("since 2024-05-01"). The server resolves these against the
+  **system clock** (never the LLM, which has no reliable current date and
+  would hallucinate one) and applies them as an `mtime` floor. Windows use
+  start-of-period semantics: "this month" → 1st of this month, "last week"
+  → 7 days back, "last year" → Jan 1 of last year.
+- **Empty windows widen, strict dates don't** — if a system-resolved window
+  ("this month", "last week") matches nothing, the search widens to the most
+  recent matching files and says so in the result meta line, instead of
+  returning an empty page. A date you typed explicitly ("since 2024-01-01",
+  `&since=`) is a real filter and is never widened.
 
 All of these compose with the category/platform filters and with each other.
 The CLI mirrors this: `python3 -m cli search ... --sort newest --since 2024-01-01`,
