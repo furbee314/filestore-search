@@ -9,6 +9,27 @@ llama.cpp server, text-generation-webui, LM Studio...) — for turning
 "firmware for my Dell R740" into a precise query and for answering
 questions in plain English.
 
+**Features at a glance**
+
+- **Natural-language search** — "firmware for my Dell R740" is rewritten by a
+  local LLM into a precise keyword + category + platform query; the results
+  themselves come from deterministic SQLite FTS5 (the LLM can't reorder or
+  skip files). No LLM? Plain FTS still works.
+- **"A or B for C"** — structured OR queries so "bios or firmware for the
+  Dell R740" returns the R740 files that have a bios or a firmware, not the
+  flat union of every word.
+- **Deliverable priority** — installables (`.rpm/.deb/.msi/.msu/.exe/.sh`,
+  ISOs, BIOS/firmware, drivers) rank above the paperwork next to them.
+- **Recency** — "latest / newest / recent", `&sort=newest`, `&since=`, and
+  time phrases ("this month", "last 30 days") resolved from the *system
+  clock*, so the LLM never hallucinates a date.
+- **Checksums** — a file's `.sha256`/`.md5` sidecar digest is read at index
+  time and returned on every result (and shown in the UI).
+- **Pagination + facets** — server-side paging, and category/platform filter
+  dropdowns showing the number of files in each category.
+- **Plain-English answers** — optional `&answer=1` asks the LLM to name the
+  best file(s) and their download path, based only on the top results.
+
 ```
                  +-------------------------------------------+
  users  ------->  |  nginx (or the app directly)             |
@@ -35,22 +56,22 @@ Zero third-party Python dependencies (stdlib only).
 | file | purpose |
 |---|---|
 | `config.py` | configuration (env vars + optional `search.json`) |
-| `indexer.py` | file classification + name/version/vendor parsing |
-| `db.py` | SQLite schema, index/refresh, FTS5 search |
-| `llm.py` | local LLM client (rewrite + answer), graceful fallback |
+| `indexer.py` | file classification + name/version/vendor parsing + deliverable priority |
+| `db.py` | SQLite schema, index/refresh, FTS5 search, time-phrase resolution, checksum sidecar digests |
+| `llm.py` | local LLM client (rewrite + answer), guardrails, graceful fallback |
 | `app.py` | web UI + JSON API + `/files/` downloads (ThreadingHTTPServer) |
-| `cli.py` | `init / index / refresh / search / llm-test / stats / serve` |
+| `cli.py` | `init / index / refresh / search / newest / llm-test / stats / serve` |
 | `filestore-search.service` | systemd unit for the web app |
 | `ollama.service` | systemd unit for Ollama (local LLM, CPU) |
 | `reindex.sh` | wrapper for cron/systemd-timer refresh |
 | `search.json.example` | example configuration (copy to `search.json`) |
 | `nginx.conf.example` | nginx vhost: proxy UI+API, alias `/files/` to your store |
-| `make_test_data.py` | generates a synthetic vendor-named store for testing |
+| `make_test_data.py` | generates a synthetic vendor-named store (incl. checksum sidecars) for testing |
 | `mock_llm.py` | mock OpenAI-compatible LLM for testing without a real one |
 | `requirements.txt` | documents Python dependencies (none — stdlib only) + host-level LLM deps |
 | `prepare-offline-ollama.sh` | build an air-gapped Ollama+model transfer bundle (run on a connected machine) |
 | `offline-install-ollama.sh` | install Ollama + model on the offline system from that bundle |
-| `test_e2e.py`, `test_download.py`, `test_robust.py` | end-to-end + robustness test scripts |
+| `test_reliability.py`, `test_e2e.py`, `test_download.py`, `test_robust.py` | unit + end-to-end + robustness test scripts |
 
 ## Local LLM on CPU (default: Ollama + qwen2.5:3b-instruct)
 
@@ -166,7 +187,7 @@ is that sequence with checksums and user/systemd setup added.
 cd /opt/filestore-search            # or wherever these files live
 export FILESTORE_SEARCH_DATA=$(pwd)/data \
        FILESTORE_SEARCH_DB=$(pwd)/test-search.db
-python3 make_test_data.py data      # 51 synthetic vendor-named files
+python3 make_test_data.py data      # 61 synthetic vendor-named files (+ 3 checksum sidecars)
 python3 -m cli init
 python3 -m cli index                # full index
 ollama pull qwen2.5:3b-instruct     # once, ~2.3GB
@@ -175,7 +196,7 @@ ollama serve &                      # or: systemctl start ollama
 python3 -m app --port 8099          # the test scripts expect port 8099
 # open http://localhost:8099  ->  "firmware for my Dell R740"
 python3 -m cli llm-test             # verify LLM connectivity
-python3 test_e2e.py && python3 test_download.py && python3 test_robust.py
+python3 test_reliability.py && python3 test_e2e.py && python3 test_download.py && python3 test_robust.py
 # (no Ollama handy? mock_llm.py stands in for it:
 #   python3 mock_llm.py --port 8901 &
 #   export FILESTORE_SEARCH_LLM_BASE=http://127.0.0.1:8901/v1 FILESTORE_SEARCH_LLM_MODEL=mock
@@ -191,16 +212,14 @@ python3 test_e2e.py && python3 test_download.py && python3 test_robust.py
    |---|---|---|
    | `data_dir` | `FILESTORE_SEARCH_DATA` | root of the file store. Everything under it is indexed and served by relative path. For this box: `/mnt` (with `Software_Library/`, `repos/`, `isos/` inside). |
    | `db_path` | `FILESTORE_SEARCH_DB` | where the SQLite index lives. Needs a writable dir for the user running the app. |
-   | `public_url` | `FILESTORE_SEARCH_URL` | base URL the UI puts on download links. If your nginx already serves the store, set this to it (e.g. `https://files.example.com`) and the app's own `/files/` endpoint is unused. Leave `""` to download through the app (`/files/...`). |
    | `llm_base` | `FILESTORE_SEARCH_LLM_BASE` | OpenAI-compatible base of your local LLM, i.e. up to and including `/v1`. Default (CPU box): Ollama on the same host, `http://127.0.0.1:11434/v1`. vLLM / llama.cpp server: `http://<host>:8000/v1`. text-generation-webui: its OpenAI-compatible URL. |
    | `llm_model` | `FILESTORE_SEARCH_LLM_MODEL` | model name the endpoint expects. Default: `qwen2.5:3b-instruct` (small instruct model, runs on CPU; Ollama tag or vLLM `--served-model-name`). |
    | `llm_api_key` | `FILESTORE_SEARCH_LLM_API_KEY` | optional. Most local servers need none (leave `""`); text-generation-webui does. |
    | `llm_timeout` | `FILESTORE_SEARCH_LLM_TIMEOUT` | seconds per LLM call. Default 60 — CPU inference is slow; bump further on weak CPUs. |
    | `llm_max_ctx` | `FILESTORE_SEARCH_LLM_MAX_CTX` | context window (tokens) sent to Ollama as `options.num_ctx`; default 4096. Lower it (2048) on RAM-tight boxes. |
    | `llm_disable` | `FILESTORE_SEARCH_LLM_DISABLE` | `true` = pure FTS mode, no LLM calls at all. |
-   | `max_results` | `FILESTORE_SEARCH_MAX_RESULTS` | cap on results returned per search. |
    | `ignored_names` | — | filename prefixes to skip while indexing. |
-   | `ignored_suffixes` | — | filename suffixes to skip while indexing (case-insensitive). Defaults cover the common checksum sidecars: `.sha1 .sha128 .sha256 .sha512 .md5`. |
+   | `ignored_suffixes` | — | filename suffixes to skip while indexing (case-insensitive). Defaults cover the common checksum sidecars: `.sha1 .sha128 .sha256 .sha512 .md5`. (Their digest values are still read onto the file they describe — see Checksums.) |
 
    Example for this box:
 
@@ -208,14 +227,12 @@ python3 test_e2e.py && python3 test_download.py && python3 test_robust.py
    {
      "data_dir": "/mnt",
      "db_path": "/var/lib/filestore-search/search.db",
-     "public_url": "https://files.example.com",
      "llm_base": "http://127.0.0.1:11434/v1",
      "llm_model": "qwen2.5:3b-instruct",
      "llm_api_key": "",
      "llm_timeout": 60,
      "llm_max_ctx": 4096,
      "llm_disable": false,
-     "max_results": 25,
      "ignored_names": [".", "~$", ".tmp", ".swp", "Thumbs.db", ".DS_Store"],
      "ignored_suffixes": [".sha1", ".sha128", ".sha256", ".sha512", ".md5"]
    }
@@ -237,9 +254,10 @@ python3 test_e2e.py && python3 test_download.py && python3 test_robust.py
    adjust `User/Group`/paths, `systemctl enable --now filestore-search`.
    It listens on 127.0.0.1:8080.
 5. **nginx**: use `nginx.conf.example` — proxy `/` (UI + API) to the app and
-   `alias /files/` to your store directory. If your store is already served
-   by nginx, just set `public_url` to its base URL and drop the `/files/`
-   location.
+   `alias /files/` to your store directory. Download/parent-folder links are
+   derived from the URL the UI is reached from (`document.location.origin`),
+   so nothing else to configure; put your public host name in front (TLS,
+   server_name) and the links follow it automatically.
 6. **LLM** (optional but recommended): point `llm_base` at your local
    OpenAI-compatible service — on this CPU-only box the default is Ollama
    with `qwen2.5:3b-instruct` (see "Local LLM on CPU" above; install Ollama
@@ -255,9 +273,17 @@ python3 test_e2e.py && python3 test_download.py && python3 test_robust.py
 1. Your free-text query hits `/api/search`.
 2. If the LLM is enabled, it rewrites the query into:
    - a tightened keyword query (filler words dropped, model numbers kept)
+   - a list of **alternatives** (`any_of`) when you ask for "A or B" — a
+     result matches if it has A *or* B, while every other required term
+     still must match. This is what makes "bios **or** firmware for the
+     Dell R740" return the R740 files that have a bios or a firmware,
+     instead of the flat union of every word (which would drown the R740
+     files in hundreds of unrelated bios and firmwares).
    - a `category` filter (firmware, linux-rpm, windows-msi, windows-patch,
-     linux-installer, ...)
-   - a `platform` filter (rhel, ubuntu, windows, ...)
+     linux-installer, ...) — values are whitelisted; a value the model
+     invents ("linux-driver") is discarded so it can't zero out the set
+   - a `platform` filter (rhel, ubuntu, windows, ...) — whitelisted the
+     same way
    - an optional `version` token
 3. SQLite FTS5 (OR-matched tokens, `bm25` ranking + a "more tokens matched
    = higher rank" re-rank) returns results; LIKE fallback catches very short
@@ -267,18 +293,37 @@ python3 test_e2e.py && python3 test_download.py && python3 test_robust.py
    (`.txt`/`.pdf`/readmes) rank last, repo metadata/manifests
    (`repomd.xml`, `Packages.gz`, GPG keys) below, and archives in between.
    This is why "dell r740 bios" returns the BIOS file rather than a readme
-   that merely mentions it. Time windows ("this month", "last 30 days",
-   "since March") are **not** part of the LLM rewrite — they are resolved
-   deterministically from the system clock (see Recency below), so the model
-   can never hallucinate a date.
-4. Optional `&answer=1`: the LLM writes a short plain-English answer naming
+   that merely mentions it. Two guardrails keep the rewrite honest:
+   - **Identifier recovery** — the rewriter may rephrase, but if it drops a
+     concrete model/part/version number from your original text
+     (e.g. `r740`, `6230`), that token is merged back into the query, so
+     the search stays pinned on the identifiers you actually typed.
+   - **Filter loosening** — if the (rewritten) category/platform filter
+     wipes out every result, the app retries progressively looser
+     (drop platform, then category) instead of returning an empty page.
+   Time windows ("this month", "last 30 days", "since March") are **not**
+   part of the LLM rewrite — they are resolved deterministically from the
+   system clock (see Recency below), so the model can never hallucinate a
+   date.
+4. **Deterministic, reproducible results.** The LLM runs once per question
+   and its rewrite is **cached** (the same question gets the same rewrite —
+   sampling is pinned, `seed=0`/`temperature=0` — and re-checked when the
+   day rolls over so a sliding time window like "this month" updates). The
+   result set itself is produced by the deterministic FTS5 layer: the LLM
+   can't skip or reorder files, and repeated searches of the same question
+   return the same pages every time.
+5. **Pagination.** Results are paged server-side: the response carries
+   `count` (this page), `total` (whole match set), `pages`, and `offset` /
+   `limit`; the UI's page bar fetches `offset` + `limit` and always restarts
+   at page 1 when a new search or filter is applied.
+6. Optional `&answer=1`: the LLM writes a short plain-English answer naming
    the best file(s) and their download path, based only on the top results
    (it cannot invent files).
 
 ### Recency ("latest / newest / recent")
 
 Recency is a first-class search dimension, backed by the file `mtime` that
-the indexer already stores. Three ways to use it:
+the indexer already stores. Ways to use it:
 
 - **Natural language** — say "latest", "newest", "recent" (e.g. "latest Dell
   R740 firmware"). The app detects the word, searches the matching files and
@@ -309,12 +354,13 @@ any keyword search.
 
 ### Checksums (`.sha256` / `.md5` sidecars)
 
-If a file sits next to a checksum sidecar — the same name plus a `.sha256`
-or `.md5` suffix (`foo.rpm.sha256`, `foo.iso.md5`) — the indexer reads the
-digest out of that sidecar and stores it on the file's row. The value is the
-first hex token in the sidecar file (the coreutils layout `DIGEST  filename`
-works, as does a bare `DIGEST`), lower-cased; sidecars with a missing or
-wrong-length digest are ignored. Checksums appear:
+Every search result carries `sha256` and `md5` fields: when a file sits next
+to a checksum sidecar — the same name plus a `.sha256` or `.md5` suffix
+(`foo.rpm.sha256`, `foo.iso.md5`) — the digest is read out of that sidecar
+at index time and stored on the file's row; otherwise the fields are empty.
+The value is the first hex token in the sidecar file (the coreutils layout
+`DIGEST  filename` works, as does a bare `DIGEST`), lower-cased; sidecars
+with a missing or wrong-length digest are ignored. Checksums appear:
 
 - in **search results** (`sha256` / `md5` fields on every result; empty
   string when no sidecar exists) — the UI shows a "Checksums" column
@@ -330,6 +376,68 @@ Classification is from filename + directory (extension, rpm/deb layout,
 vendor/product patterns), so it works with whatever the vendors named the
 files. You can also filter manually in the UI (category / platform
 dropdowns) and search a subset.
+
+## JSON API
+
+All endpoints are `GET` and return JSON.
+
+| endpoint | purpose |
+|---|---|
+| `GET /` | single-page UI |
+| `GET /app.css`, `GET /app.js` | front-end assets |
+| `GET /api/health` | `{ok, total, llm_enabled, llm_reachable, llm_model, llm_base, data_dir}` — quick liveness/LLM probe |
+| `GET /api/facets` | category + platform lists with per-category counts, and the total file count (drives the filter dropdowns) |
+| `GET /api/search` | the main search (below) |
+| `GET /files/<path>` | download a file by its store-relative path (Range requests supported) |
+
+**`/api/search`** — parameters:
+
+| param | default | meaning |
+|---|---|---|
+| `q` | — | the free-text query (required). |
+| `limit` | 20 | page size, 1–100. |
+| `offset` | 0 | 0-based page offset. |
+| `category` | all | filter to one category (see facets). |
+| `platform` | all | filter to one platform. |
+| `sort` | relevance | `relevance` or `newest` (most-recently-modified first). |
+| `since` | — | date floor (ISO date / datetime / epoch) — see Recency. |
+| `answer` | — | `1`/`true`/`yes` to also get a plain-English LLM answer. |
+
+Response:
+
+```json
+{
+  "query": "firmware for my Dell R740",
+  "rewritten_query": "dell r740 bios firmware",
+  "llm_used": true,
+  "llm_meta": {"query": "dell r740 bios firmware", "any_of": null,
+               "category": "firmware", "platform": null, "version": null,
+               "since": null, "dropped_identifiers": ["r740"]},
+  "results": [
+    {"id": 1, "path": "Software_Library/.../dell-bios-r740-...zip",
+     "name": "dell-bios-r740-x4.4.4-a01.zip", "category": "firmware",
+     "platform": "unknown", "arch": "unknown", "file_type": "zip",
+     "version": "4.4.4", "vendor": "Dell", "description": "...",
+     "size": 123456, "mtime": 1700000000.0,
+     "sha256": "540c1238...", "md5": ""}
+  ],
+  "answer": "The Dell R740 BIOS is ...",
+  "count": 1, "total": 42, "offset": 0, "limit": 20, "pages": 3,
+  "sort": "relevance", "since": null
+}
+```
+
+`results` holds one page (`count` rows, starting at `offset`); `total` is the
+length of the whole match set and `pages` the number of pages at `limit`.
+Each result always carries `sha256`/`md5` (empty string when the file has no
+sidecar). `llm_meta` is present when the LLM ran; it may flag
+`dropped_identifiers` (recovered model numbers), `since_ignored` (an
+LLM-invented date was discarded in favour of the system clock), or
+`window_widened` (an empty relative time window was widened).
+
+The CLI mirrors every one of these: `python3 -m cli search ... [--limit
+--category --platform --sort newest --since ...] [--json]` and
+`python3 -m cli newest [--category --platform --since ...]`.
 
 ## Testing without a real LLM
 

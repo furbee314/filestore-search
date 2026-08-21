@@ -4,11 +4,11 @@ Everything can be overridden with environment variables so the same
 installation works under nginx+gunicorn, systemd, or plain `python -m`.
 
 Key environment variables:
-  FILESTORE_SEARCH_CONFIG   path to a YAML/JSON config file (optional)
+  FILESTORE_SEARCH_CONFIG   path to a JSON config file (optional)
   FILESTORE_SEARCH_ROOT     directory that contains the config + db + data
   FILESTORE_SEARCH_DATA     directory of files to index (default: $ROOT/data)
   FILESTORE_SEARCH_DB       path to SQLite db (default: $ROOT/search.db)
-  FILESTORE_SEARCH_URL      public base URL the web UI uses to build download links
+  FILESTORE_SEARCH_PORT     port the web app binds when started via `python -m app`
   FILESTORE_SEARCH_LLM_BASE base URL of the local LLM (OpenAI-compatible /v1/chat/completions).
                             Default: Ollama on this machine (CPU), http://127.0.0.1:11434/v1
   FILESTORE_SEARCH_LLM_MODEL model name to request (default: qwen2.5:3b-instruct,
@@ -66,7 +66,6 @@ def load_config():
         root=root,
         data_dir=os.path.abspath(os.path.expanduser(pick("data_dir", "FILESTORE_SEARCH_DATA", data_dir))),
         db_path=os.path.abspath(os.path.expanduser(pick("db_path", "FILESTORE_SEARCH_DB", db_path))),
-        public_url=pick("public_url", "FILESTORE_SEARCH_URL", ""),
         # Default to Ollama serving a small instruct model on CPU. A 3B
         # 4-bit model fits in ~2GB RAM and is fast enough on any modern
         # CPU for the two jobs this app uses it for (query rewrite + short
@@ -79,7 +78,6 @@ def load_config():
         llm_timeout=float(pick("llm_timeout", "FILESTORE_SEARCH_LLM_TIMEOUT", 60)),
         llm_max_ctx=int(pick("llm_max_ctx", "FILESTORE_SEARCH_LLM_MAX_CTX", 4096)),
         llm_disable=_env_bool("FILESTORE_SEARCH_LLM_DISABLE", bool(file_cfg.get("llm_disable", False))),
-        max_results=int(pick("max_results", "FILESTORE_SEARCH_MAX_RESULTS", 25)),
         # files to skip (dotfiles, temp files)
         ignored_names=tuple(file_cfg.get("ignored_names", [".*", "~$", ".tmp"])),
         # suffixes to skip (case-insensitive): checksum sidecars live next to

@@ -3,10 +3,12 @@
 # Serves the search UI + API (proxying to the local Python app) AND the
 # actual file downloads from your file store (/mnt here).
 #
-# If your file store is ALREADY served by nginx today, you can instead keep
-# that location and point "Download" links at it by setting "public_url" in
-# search.json (or FILESTORE_SEARCH_URL) to its base URL, and skipping the
-# /files/ location below.
+# The UI builds its download links from the URL it was reached from
+# (document.location.origin), so it "just works" behind this nginx: a
+# request to https://files.example.com/repos/... yields a download link
+# to the same host. If your file store is ALREADY served by nginx under a
+# different path, proxy /files/ to that location (as below) — no config
+# change needed.
 
 upstream filestore_search {
     server 127.0.0.1:8080;

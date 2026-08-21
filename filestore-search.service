@@ -8,8 +8,9 @@
 #   3) systemctl daemon-reload && systemctl enable --now filestore-search
 #
 # To run behind your existing nginx (recommended; nginx already serves
-# downloads), proxy / to this port and point search links at nginx's
-# public_url (set FILESTORE_SEARCH_URL or "public_url" in search.json).
+# downloads), proxy / to this port and keep the /files/ location pointing
+# at the store — the UI derives download links from the URL it is reached
+# from (document.location.origin), so no extra configuration is needed.
 
 [Unit]
 Description=Offline file store search (SQLite FTS5 + local LLM)
