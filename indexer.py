@@ -250,10 +250,11 @@ _ARCHIVE_EXT = {
     "zip", "tar", "gz", "tgz", "xz", "bz2", "7z", "rar", "jar", "whl",
 }
 # priority 1: repo metadata / manifests / signatures (not installable, but
-# often what a user actually wants when looking up a package)
+# often what a user actually wants when looking up a package). Note:
+# .xml files are excluded from the index entirely (config.ignored_suffixes).
 _METADATA_EXT = {
     "repomd", "release", "gpg", "asc", "sig", "json", "ya", "idx",
-    "listindex", "index", "control", "xml",
+    "listindex", "index", "control",
 }
 # priority 0: documentation and other non-software. A .txt is never
 # installable even when a directory heuristic misclassifies it (e.g. a
@@ -261,8 +262,9 @@ _METADATA_EXT = {
 _DOC_EXT = {"txt", "log", "readme", "rst", "pdf", "html", "csv",
             "md", "markdown"}
 # known manifest basenames that are metadata, not installables
+# (repomd.xml itself is excluded from the index via ignored_suffixes)
 _MANIFEST_BASENAMES = {
-    "repomd.xml", "release", "packages", "repodata", "packages.gz",
+    "release", "packages", "repodata", "packages.gz",
     "inrelease", "control", "control.index", "packagelist", "filelists",
 }
 

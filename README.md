@@ -187,7 +187,7 @@ is that sequence with checksums and user/systemd setup added.
 cd /opt/filestore-search            # or wherever these files live
 export FILESTORE_SEARCH_DATA=$(pwd)/data \
        FILESTORE_SEARCH_DB=$(pwd)/test-search.db
-python3 make_test_data.py data      # 61 synthetic vendor-named files (+ 3 checksum sidecars)
+python3 make_test_data.py data      # synthetic store: 55 content files + 5 sidecars + 1 .xml
 python3 -m cli init
 python3 -m cli index                # full index
 ollama pull qwen2.5:3b-instruct     # once, ~2.3GB
@@ -219,7 +219,7 @@ python3 test_reliability.py && python3 test_e2e.py && python3 test_download.py &
    | `llm_max_ctx` | `FILESTORE_SEARCH_LLM_MAX_CTX` | context window (tokens) sent to Ollama as `options.num_ctx`; default 4096. Lower it (2048) on RAM-tight boxes. |
    | `llm_disable` | `FILESTORE_SEARCH_LLM_DISABLE` | `true` = pure FTS mode, no LLM calls at all. |
    | `ignored_names` | — | filename prefixes to skip while indexing. |
-   | `ignored_suffixes` | — | filename suffixes to skip while indexing (case-insensitive). Defaults cover the common checksum sidecars: `.sha1 .sha128 .sha256 .sha512 .md5`. (Their digest values are still read onto the file they describe — see Checksums.) |
+   | `ignored_suffixes` | — | filename suffixes to skip while indexing (case-insensitive). Defaults cover the checksum sidecars (`.sha1 .sha128 .sha256 .sha512 .md5`) plus `.xml`. These files are never indexed or returned; sidecar digest values are still read onto the file they describe (see Checksums). |
 
    Example for this box:
 
@@ -291,7 +291,7 @@ python3 test_reliability.py && python3 test_e2e.py && python3 test_download.py &
    installables (`.rpm/.deb/.msi/.msu/.exe/.sh` installers, ISOs, BIOS/firmware
    bundles, drivers) outrank the paperwork that lives next to them: docs
    (`.txt`/`.pdf`/readmes) rank last, repo metadata/manifests
-   (`repomd.xml`, `Packages.gz`, GPG keys) below, and archives in between.
+   (`Packages.gz`, GPG keys) below, and archives in between.
    This is why "dell r740 bios" returns the BIOS file rather than a readme
    that merely mentions it. Two guardrails keep the rewrite honest:
    - **Identifier recovery** — the rewriter may rephrase, but if it drops a
@@ -370,7 +370,9 @@ with a missing or wrong-length digest are ignored. Checksums appear:
   sidecars automatically.
 
 Sidecar files are *not* indexed as files of their own (see
-`ignored_suffixes`), so you never search the checksum twice.
+`ignored_suffixes`), so you never search the checksum twice. `.xml` files
+(repo manifests such as `repomd.xml`) are excluded the same way: skipped
+while indexing, so they never appear in results.
 
 Classification is from filename + directory (extension, rpm/deb layout,
 vendor/product patterns), so it works with whatever the vendors named the

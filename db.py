@@ -162,7 +162,8 @@ def iter_files(cfg):
     """Yield (relpath, stat_result) for every file under data_dir that is not ignored."""
     ignored = set(cfg["ignored_names"])
     # suffix-based skips (case-insensitive): checksum sidecars like
-    # foo.zip.sha256 / foo.rpm.sha128 must not pollute the index
+    # foo.zip.sha256 / foo.rpm.sha128 and .xml repo metadata must not
+    # pollute the index
     ignored_suffixes = tuple(s.lower() for s in cfg.get("ignored_suffixes", ()))
     data_dir = cfg["data_dir"]
     for dirpath, dirnames, filenames in os.walk(data_dir):

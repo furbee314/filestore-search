@@ -71,7 +71,8 @@ FILES = [
     "Software_Library/Drivers/linux/symantec/install-symantec-endpoint.sh",
     # --- Windows Update / patch bundles (.msu, priority 3) ---
     "Software_Library/Drivers/windows/dell/dell-om-agent-7.4.0-win-x64.msu",
-    # --- repo metadata / manifests (priority 1, demoted below deliverables) ---
+    # --- repo metadata / manifests (priority 1, demoted below deliverables);
+    #     repomd.xml is on disk only to prove the .xml exclusion end-to-end ---
     "repos/RHEL9/repodata/repomd.xml",
     "repos/RHEL9/Packages.gz",
     # --- isos (install / boot media) ---

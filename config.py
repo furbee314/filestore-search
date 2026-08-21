@@ -81,8 +81,10 @@ def load_config():
         # files to skip (dotfiles, temp files)
         ignored_names=tuple(file_cfg.get("ignored_names", [".*", "~$", ".tmp"])),
         # suffixes to skip (case-insensitive): checksum sidecars live next to
-        # the files they describe and would otherwise pollute the index
+        # the files they describe and would otherwise pollute the index;
+        # .xml (repo metadata / manifests) is excluded by user request
         ignored_suffixes=tuple(file_cfg.get(
-            "ignored_suffixes", [".sha1", ".sha128", ".sha256", ".sha512", ".md5"])),
+            "ignored_suffixes",
+            [".sha1", ".sha128", ".sha256", ".sha512", ".md5", ".xml"])),
     )
     return cfg

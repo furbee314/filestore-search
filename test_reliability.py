@@ -143,19 +143,34 @@ assert any("r740" in n for n in top[:2]), \
 print("re-ranker includes OR terms: OK")
 
 # ---------------------------------------------------------------------------
-# checksum sidecars (.sha128/.sha256/...) must never enter the index
+# checksum sidecars (.sha128/.sha256/...) and .xml files must never
+# enter the index
 # ---------------------------------------------------------------------------
 leaked = con.execute(
     "SELECT COUNT(*) FROM files WHERE path LIKE '%.sha1' "
     "OR path LIKE '%.sha256' OR path LIKE '%.sha128' "
-    "OR path LIKE '%.sha512' OR path LIKE '%.md5'").fetchone()[0]
-assert leaked == 0, f"checksum sidecars leaked into the index: {leaked}"
+    "OR path LIKE '%.sha512' OR path LIKE '%.md5'"
+    " OR LOWER(path) LIKE '%.xml'").fetchone()[0]
+assert leaked == 0, f"sidecars or .xml files leaked into the index: {leaked}"
 total_no_sidecars = total_all
 on_disk = sum(len(fs) for _, _, fs in os.walk(os.path.join(HERE, "data")))
 assert total_no_sidecars < on_disk, \
     "expected sidecars on disk but none indexed (is the exclusion a no-op?)"
 print(f"checksum sidecars excluded "
       f"({on_disk} on disk, {total_no_sidecars} indexed): OK")
+
+# .xml exclusion end-to-end: the synthetic store ships a repomd.xml on disk;
+# it must NOT be indexed, and it must not be searchable
+xml_on_disk = sum(
+    1 for _dp, _dn, fns in os.walk(os.path.join(HERE, "data"))
+    for fn in fns if fn.lower().endswith(".xml"))
+assert xml_on_disk >= 1, "expected at least one .xml file in the test store"
+xml_indexed = con.execute(
+    "SELECT COUNT(*) FROM files WHERE LOWER(path) LIKE '%.xml'").fetchone()[0]
+assert xml_indexed == 0, f"{xml_indexed} .xml file(s) indexed"
+assert not db.search(con, "repomd", limit=20), \
+    "repomd.xml content still reachable through search"
+print(f".xml excluded ({xml_on_disk} on disk, {xml_indexed} indexed): OK")
 
 # ---------------------------------------------------------------------------
 # checksum sidecars: their digest values must land in the index + results
@@ -268,8 +283,6 @@ assert prio("install-symantec-endpoint.sh") == 3, \
     f".sh installer should be priority 3, got {prio('install-symantec-endpoint.sh')}"
 assert prio("dell-om-agent-7.4.0-win-x64.msu") == 3, \
     f".msu patch should be priority 3, got {prio('dell-om-agent-7.4.0-win-x64.msu')}"
-assert prio("repomd.xml") == 1, \
-    f"repo metadata should be priority 1, got {prio('repomd.xml')}"
 assert prio("Packages.gz") == 1, \
     f"repo manifest should be priority 1, got {prio('Packages.gz')}"
 print("priority stored per file type (rpm/.msu/.sh/no-ext=3, metadata=1, doc=0): OK")
