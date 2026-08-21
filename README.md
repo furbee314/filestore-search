@@ -307,6 +307,25 @@ The CLI mirrors this: `python3 -m cli search ... --sort newest --since 2024-01-0
 and `python3 -m cli newest` to list the most recently modified files without
 any keyword search.
 
+### Checksums (`.sha256` / `.md5` sidecars)
+
+If a file sits next to a checksum sidecar — the same name plus a `.sha256`
+or `.md5` suffix (`foo.rpm.sha256`, `foo.iso.md5`) — the indexer reads the
+digest out of that sidecar and stores it on the file's row. The value is the
+first hex token in the sidecar file (the coreutils layout `DIGEST  filename`
+works, as does a bare `DIGEST`), lower-cased; sidecars with a missing or
+wrong-length digest are ignored. Checksums appear:
+
+- in **search results** (`sha256` / `md5` fields on every result; empty
+  string when no sidecar exists) — the UI shows a "Checksums" column
+  (truncated, full value on hover), and `cli search` / `cli newest` print
+  them under each file.
+- in the **index itself**, so a reindex or incremental refresh picks up new
+  sidecars automatically.
+
+Sidecar files are *not* indexed as files of their own (see
+`ignored_suffixes`), so you never search the checksum twice.
+
 Classification is from filename + directory (extension, rpm/deb layout,
 vendor/product patterns), so it works with whatever the vendors named the
 files. You can also filter manually in the UI (category / platform

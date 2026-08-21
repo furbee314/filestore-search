@@ -525,6 +525,10 @@ a.parent:hover { text-decoration:underline; }
   background:#0b1220; border:1px solid var(--line); color:var(--mut); white-space:nowrap; }
 .badge.cat { color:var(--acc); border-color:var(--acc); }
 .size { color:var(--mut); font-variant-numeric:tabular-nums; white-space:nowrap; }
+.chksum { display:inline-block; color:var(--mut); font-size:12px;
+  font-family:ui-monospace,Menlo,Consolas,monospace; margin:1px 4px 1px 0;
+  cursor:help; white-space:nowrap; }
+.chksum:hover { color:var(--acc); }
 .mtime { color:var(--mut); font-variant-numeric:tabular-nums; white-space:nowrap; font-size:12.5px; }
 a.dl { color:var(--acc); text-decoration:none; }
 a.dl:hover { text-decoration:underline; }
@@ -695,10 +699,22 @@ function renderMeta(d){
 function renderResults(rows){
   if(!rows.length){ $('results').innerHTML='<div class="empty">No files matched. Try different words, or enable &#8220;AI answer&#8221; to let the LLM interpret it.</div>'; return; }
   const base = document.location.origin;
-  let h = `<table><thead><tr><th>File</th><th>Category</th><th>Platform</th><th>Version</th><th>Modified</th><th>Size</th><th></th></tr></thead><tbody>`;
+  let h = `<table><thead><tr><th>File</th><th>Category</th><th>Platform</th><th>Version</th><th>Modified</th><th>Size</th><th>Checksums</th><th></th></tr></thead><tbody>`;
   for(const r of rows){
     const dl = `/files/${encodeURIComponent(r.path)}`;
     const purl = parentHref(r.path);
+    // Checksums come from sibling sidecar files (<name>.sha256 / .md5)
+    // read at index time. Truncated in the cell; full value in the tooltip.
+    let cs = '';
+    if(r.sha256){
+      const tip = r.sha256;
+      cs += `<span class="chksum" title="sha256: ${esc(tip)}">sha256 ${esc(tip.slice(0,8))}&#8230;</span>`;
+    }
+    if(r.md5){
+      const tip = r.md5;
+      cs += `<span class="chksum" title="md5: ${esc(tip)}">md5 ${esc(tip.slice(0,8))}&#8230;</span>`;
+    }
+    if(!cs) cs = '&ndash;';
     h += `<tr>
       <td><div class="name">${esc(r.name)}</div><div class="path">${esc(r.path)}</div>
       <a class="parent" href="${esc(purl)}" title="Browse this file's folder in the store">Parent folder</a></td>
@@ -707,6 +723,7 @@ function renderResults(rows){
       <td>${esc(r.version)||'&ndash;'}</td>
       <td class="size">${fmtDate(r.mtime)}</td>
       <td class="size">${fmtSize(r.size)}</td>
+      <td class="size">${cs}</td>
       <td><a class="dl" href="${dl}" download>Download</a></td>
       </tr>`;
   }

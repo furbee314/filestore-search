@@ -17,13 +17,13 @@ def connect(cfg, check_same_thread=True):
     con = sqlite3.connect(cfg["db_path"], check_same_thread=check_same_thread)
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
-    ensure_schema(con)
+    ensure_schema(con, cfg)
     return con
 
 
-def ensure_schema(con):
+def ensure_schema(con, cfg=None):
     con.executescript(SCHEMA)
-    _migrate(con)
+    _migrate(con, cfg)
     # upsert (not INSERT OR IGNORE): an existing v1 row must advance to 2,
     # otherwise _migrate re-runs its full-table backfill on every connect.
     con.execute(
@@ -33,13 +33,16 @@ def ensure_schema(con):
     con.commit()
 
 
-def _migrate(con):
+def _migrate(con, cfg=None):
     """In-place upgrades for existing databases.
 
     v1 -> v2: add the ``files.priority`` column (deliverable weight) and
     backfill it for rows already in the index. Gated on the stored
     schema_version so the backfill (which rescans deliverable rows) runs
     exactly once, not on every connect.
+
+    v2 -> v3: add the ``files.sha256`` / ``files.md5`` columns (checksum
+    sidecar values) and backfill them by reading the sibling sidecar files.
     """
     has_table = con.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='files'"
@@ -51,21 +54,78 @@ def _migrate(con):
         "SELECT value FROM meta WHERE key = 'schema_version'"
     ).fetchone()
     prev = int(row[0]) if row and str(row[0]).isdigit() else 0
-    if prev >= 2:
+    if prev < 2:
+        if "priority" not in cols:
+            con.execute(
+                "ALTER TABLE files ADD COLUMN priority INTEGER NOT NULL DEFAULT 3")
+        # Backfill: every row in a v1 DB has priority=3 (the ALTER default),
+        # so recompute from the stored name/category/file_type. Real
+        # deliverables come back to 3 (no-op); docs/metadata drop to their
+        # true weight.
+        stale = con.execute(
+            "SELECT id, name, category, file_type FROM files"
+        ).fetchall()
+        con.executemany(
+            "UPDATE files SET priority = ? WHERE id = ?",
+            [(priority_for(cat, ftype, name), i)
+             for i, name, cat, ftype in stale])
+    if prev < 3:
+        for col in ("sha256", "md5"):
+            if col not in cols:
+                con.execute(
+                    f"ALTER TABLE files ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+        # Backfill the checksum sidecar values: read each row's sibling
+        # sidecar file. The store layout is stable between schema upgrades,
+        # so the recorded paths still exist.
+        _backfill_sidecars(con, cfg)
+
+
+_SIDECAR_EXTS = (".sha256", ".md5")
+# The first whitespace-separated token in a sidecar file is the digest
+# (coreutils layout: "HASH  filename" or just "HASH").
+_DIGEST_RE = re.compile(r"[0-9a-fA-F]+")
+
+
+def read_sidecar_digests(root, name, limit_bytes=64):
+    """Return (sha256, md5) from sibling sidecar files for ``name``.
+
+    A sidecar is a file in the SAME directory whose name is the file's
+    name plus a digest suffix: ``foo.bin.sha256`` / ``foo.bin.md5``.
+    ``name`` is a path relative to ``root`` (the store root); the sidecar
+    is a sibling, so its path is just ``root/name + suffix``. Missing,
+    unreadable, or garbage sidecars yield '' (the caller stores it as an
+    empty string, which the UI/API render as "no known checksum").
+    """
+    sha256 = md5 = ""
+    for suffix in _SIDECAR_EXTS:
+        try:
+            with open(os.path.join(root, name + suffix), "r",
+                      errors="replace") as f:
+                tok = _DIGEST_RE.search(f.read(limit_bytes))
+        except OSError:
+            continue
+        if not tok:
+            continue
+        val = tok.group(0).lower()
+        if suffix == ".sha256" and len(val) == 64:
+            sha256 = val
+        elif suffix == ".md5" and len(val) == 32:
+            md5 = val
+    return sha256, md5
+
+
+def _backfill_sidecars(con, cfg):
+    """Fill files.sha256 / files.md5 from the sidecar files on disk."""
+    if cfg is None:
         return
-    if "priority" not in cols:
-        con.execute(
-            "ALTER TABLE files ADD COLUMN priority INTEGER NOT NULL DEFAULT 3")
-    # Backfill: every row in a v1 DB has priority=3 (the ALTER default), so
-    # recompute from the stored name/category/file_type. Real deliverables
-    # come back to 3 (no-op); docs/metadata drop to their true weight.
-    stale = con.execute(
-        "SELECT id, name, category, file_type FROM files"
-    ).fetchall()
+    data_dir = cfg["data_dir"]
+    if not os.path.isdir(data_dir):
+        return
+    updates = []
+    for i, p in con.execute("SELECT id, path FROM files"):
+        updates.append((*read_sidecar_digests(data_dir, p), i))
     con.executemany(
-        "UPDATE files SET priority = ? WHERE id = ?",
-        [(priority_for(cat, ftype, name), i)
-         for i, name, cat, ftype in stale])
+        "UPDATE files SET sha256 = ?, md5 = ? WHERE id = ?", updates)
 
 
 def _row_from_file(root, relpath, st):
@@ -78,6 +138,7 @@ def _row_from_file(root, relpath, st):
     # for .tar.gz etc
     if name.lower().endswith((".tar.gz", ".tar.bz2", ".tar.xz", ".msi.zip")):
         ext = name.lower().rsplit(".", 2)[-2] + "." + name.lower().rsplit(".", 1)[-1]
+    sha256, md5 = read_sidecar_digests(root, relpath)
     return {
         "path": relpath,
         "name": name,
@@ -92,6 +153,8 @@ def _row_from_file(root, relpath, st):
         "mtime": st.st_mtime,
         "indexed_at": time.time(),
         "priority": priority_for(category, ext, name),
+        "sha256": sha256,
+        "md5": md5,
     }
 
 
@@ -142,13 +205,14 @@ def full_reindex(cfg, con, quiet=False):
         files_rows.append((i, r["path"], r["name"], r["category"], r["platform"],
                            r["arch"], r["file_type"], r["version"], r["vendor"],
                            r["description"], r["size"], r["mtime"], r["indexed_at"],
-                           r["priority"]))
+                           r["priority"], r["sha256"], r["md5"]))
         fts_rows.append((i, r["path"], r["name"], r["version"], r["description"],
                          r["vendor"]))
     con.executemany(
         """INSERT INTO files (id, path, name, category, platform, arch, file_type,
-             version, vendor, description, size, mtime, indexed_at, priority)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", files_rows)
+             version, vendor, description, size, mtime, indexed_at, priority,
+             sha256, md5)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", files_rows)
     con.executemany(
         "INSERT INTO files_fts(rowid, path, name, version, description, vendor)"
         " VALUES (?, ?, ?, ?, ?, ?)", fts_rows)
@@ -176,10 +240,10 @@ def incremental_refresh(cfg, con):
             con.execute(
                 """INSERT INTO files
                    (path, name, category, platform, arch, file_type, version, vendor,
-                    description, size, mtime, indexed_at, priority)
+                    description, size, mtime, indexed_at, priority, sha256, md5)
                    VALUES (:path, :name, :category, :platform, :arch, :file_type,
                     :version, :vendor, :description, :size, :mtime, :indexed_at,
-                    :priority)""",
+                    :priority, :sha256, :md5)""",
                 row)
             fid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
             con.execute(
@@ -202,7 +266,7 @@ def incremental_refresh(cfg, con):
                 """UPDATE files SET name=:name, category=:category, platform=:platform,
                    arch=:arch, file_type=:file_type, version=:version, vendor=:vendor,
                    description=:description, size=:size, mtime=:mtime, indexed_at=:indexed_at,
-                   priority=:priority
+                   priority=:priority, sha256=:sha256, md5=:md5
                    WHERE path=:path""", row)
             con.execute(
                 "INSERT INTO files_fts(rowid, path, name, version, description, vendor)"
@@ -662,6 +726,7 @@ def search(con, query, limit=25, offset=0, category=None, platform=None,
     sql = """
       SELECT f.id, f.path, f.name, f.category, f.platform, f.arch, f.file_type,
              f.version, f.vendor, f.description, f.size, f.mtime, f.priority,
+             f.sha256, f.md5,
              bm25(files_fts, 10.0, 10.0, 5.0, 1.0, 1.0) AS score
       FROM files_fts
       JOIN files f ON f.id = files_fts.rowid
@@ -688,6 +753,7 @@ def search(con, query, limit=25, offset=0, category=None, platform=None,
         like_q = "%" + query.strip().lower()[:40] + "%"
         sql2 = """SELECT id, path, name, category, platform, arch, file_type,
                          version, vendor, description, size, mtime, priority,
+                         sha256, md5,
                          1e8 AS score
                   FROM files
                   WHERE (lower(description) LIKE ? OR lower(name) LIKE ?)"""
@@ -711,7 +777,9 @@ def search(con, query, limit=25, offset=0, category=None, platform=None,
             "platform": r[4], "arch": r[5], "file_type": r[6], "version": r[7],
             "vendor": r[8], "description": r[9], "size": r[10], "mtime": r[11],
             "priority": r[12],
-            "score": r[13],
+            "sha256": r[13] or "",
+            "md5": r[14] or "",
+            "score": r[15],
         }
         results.append(d)
     # re-rank: more matched tokens => better. Matching is word-boundary
@@ -752,7 +820,7 @@ def newest(con, limit, offset=0, category=None, platform=None, min_mtime=None):
     """
     off = max(0, int(offset))
     sql = """SELECT id, path, name, category, platform, arch, file_type,
-                    version, vendor, description, size, mtime
+                    version, vendor, description, size, mtime, sha256, md5
              FROM files"""
     conds = []
     params = []
@@ -775,6 +843,7 @@ def newest(con, limit, offset=0, category=None, platform=None, min_mtime=None):
         "id": r[0], "path": r[1], "name": r[2], "category": r[3],
         "platform": r[4], "arch": r[5], "file_type": r[6], "version": r[7],
         "vendor": r[8], "description": r[9], "size": r[10], "mtime": r[11],
+        "sha256": r[12] or "", "md5": r[13] or "",
     } for r in rows]
 
 

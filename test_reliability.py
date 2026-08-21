@@ -8,6 +8,8 @@ Run:
   python3 test_reliability.py
 """
 import os
+import shutil
+import sqlite3
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -154,6 +156,102 @@ assert total_no_sidecars < on_disk, \
     "expected sidecars on disk but none indexed (is the exclusion a no-op?)"
 print(f"checksum sidecars excluded "
       f"({on_disk} on disk, {total_no_sidecars} indexed): OK")
+
+# ---------------------------------------------------------------------------
+# checksum sidecars: their digest values must land in the index + results
+# ---------------------------------------------------------------------------
+print("\n== sidecar digests in results ==")
+import hashlib  # noqa: E402
+
+def digest_of(relpath, algo):
+    with open(os.path.join(HERE, "data", relpath), "rb") as f:
+        return hashlib.new(algo, f.read()).hexdigest()
+
+iso_rel = "isos/rhel-9.4-x86_64-dvd.iso"
+row = con.execute(
+    "SELECT sha256, md5 FROM files WHERE path=?", (iso_rel,)).fetchone()
+assert row[0] == digest_of(iso_rel, "sha256"), \
+    f"stored sha256 {row[0][:12]}... != actual {digest_of(iso_rel, 'sha256')[:12]}..."
+assert row[1] == "", f"no .md5 sidecar expected for {iso_rel}, got {row[1]!r}"
+print(f"sha256 stored matches the file's real digest ({iso_rel}): OK")
+
+# md5 sidecar (coreutils layout: "DIGEST  filename")
+lenovo_rel = ("Software_Library/Admin_Software/lenovo/"
+              "lenovo-bios-t14-gen3-mncn25ww.zip")
+row = con.execute(
+    "SELECT md5 FROM files WHERE path=?", (lenovo_rel,)).fetchone()
+assert row[0] == digest_of(lenovo_rel, "md5"), \
+    "stored md5 does not match the .md5 sidecar content"
+print(f"md5 stored matches the .md5 sidecar ({lenovo_rel}): OK")
+
+# every sidecar on disk must have populated the matching column
+for suffix, col in ((".sha256", "sha256"), (".md5", "md5")):
+    expect = 0
+    for dp, _dn, fns in os.walk(os.path.join(HERE, "data")):
+        for fn in fns:
+            if fn.endswith(suffix):
+                main = fn[:-len(suffix)]
+                r = con.execute(
+                    "SELECT 1 FROM files WHERE path=? COLLATE NOCASE",
+                    (os.path.relpath(os.path.join(dp, main),
+                                     os.path.join(HERE, "data")),)).fetchone()
+                if r:
+                    expect += 1
+    got = con.execute(
+        f"SELECT COUNT(*) FROM files WHERE {col} != ''").fetchone()[0]
+    assert got == expect, f"expected {expect} files with {col}, got {got}"
+print(f"all sidecars with an indexed main file are stored "
+      f"(sha256 + md5): OK")
+
+# unit: reader handles missing / garbage sidecars without raising
+assert db.read_sidecar_digests(os.path.join(HERE, "data"),
+                               "isos/no-such-file.iso") == ("", "")
+gdir = os.path.join(tempfile.gettempdir(), "fss-sidecar-garbage")
+os.makedirs(gdir, exist_ok=True)
+g_main = os.path.join(gdir, "g.iso")
+g_bad = os.path.join(gdir, "g.iso.sha256")
+open(g_main, "wb").close()
+open(g_bad, "w").write("not a digest at all\n")
+assert db.read_sidecar_digests(gdir, "g.iso") == ("", "")
+os.unlink(g_bad)
+# valid but wrong-length digest is rejected, not stored
+open(g_bad, "w").write("beef\n")
+assert db.read_sidecar_digests(gdir, "g.iso") == ("", "")
+os.unlink(g_bad)
+os.unlink(g_main)
+os.rmdir(gdir)
+print("sidecar reader: missing/garbage/wrong-length digests -> '': OK")
+
+# search() results carry the values (both FTS and LIKE paths)
+by_path = {r["path"]: r for r in db.search(con, "rhel dvd", limit=50)}
+r = by_path.get(iso_rel)
+assert r and r.get("sha256") == digest_of(iso_rel, "sha256"), \
+    f"search result missing sha256 for {iso_rel}: {r and r.get('sha256')}"
+assert r.get("md5") == "", "no md5 expected for the iso"
+by_path = {r["path"]: r for r in db.search(con, "bios t14 gen3",
+                                           limit=50)}
+r = by_path.get(lenovo_rel)
+assert r and r.get("md5") == digest_of(lenovo_rel, "md5"), \
+    f"search result missing md5 for {lenovo_rel}"
+print("search() results include sha256/md5 where sidecars exist: OK")
+
+# newest() carries the values too
+rows = db.newest(con, 200)
+by_path = {r["path"]: r for r in rows}
+assert by_path[iso_rel]["sha256"] == digest_of(iso_rel, "sha256")
+assert by_path[lenovo_rel]["md5"] == digest_of(lenovo_rel, "md5")
+print("newest() results include sha256/md5: OK")
+
+# files without sidecars must carry empty strings, not None
+no_side = con.execute(
+    "SELECT COUNT(*) FROM files").fetchone()[0]
+empty = con.execute(
+    "SELECT COUNT(*) FROM files WHERE sha256 = '' AND md5 = ''").fetchone()[0]
+assert empty > 0, "expected most files to lack sidecars"
+res = db.search(con, "readme", limit=5)
+assert all("sha256" in r and "md5" in r for r in res)
+print(f"result dicts always carry sha256/md5 keys "
+      f"({empty} of {no_side} files have none): OK")
 
 # ---------------------------------------------------------------------------
 # deliverable priority: installables rank above their paperwork
@@ -461,5 +559,80 @@ for p in (tt_fresh, tt_old):
     os.unlink(p)
 os.rmdir(tt_dir)
 db.full_reindex(CFG, con, quiet=True)
+
+# ---------------------------------------------------------------------------
+# schema migration: a v2 database gains sha256/md5 and gets backfilled
+# ---------------------------------------------------------------------------
+print("\n== v2 -> v3 migration ==")
+mig_db = os.path.join(tempfile.gettempdir(), "fss-mig-test.db")
+for p in (mig_db, mig_db + "-wal", mig_db + "-shm"):
+    try:
+        os.unlink(p)
+    except FileNotFoundError:
+        pass
+mig_data = os.path.join(tempfile.gettempdir(), "fss-mig-data")
+shutil.rmtree(mig_data, ignore_errors=True)
+os.makedirs(mig_data)
+mig_iso = os.path.join(mig_data, "mig.iso")
+mig_iso_data = b"migration-test-payload" * 100
+with open(mig_iso, "wb") as f:
+    f.write(mig_iso_data)
+mig_sha = hashlib.sha256(mig_iso_data).hexdigest()
+with open(mig_iso + ".sha256", "w") as f:
+    f.write(mig_sha + "  mig.iso\n")
+
+# build a v2-shaped DB: priority column, no sha256/md5, schema_version=2
+con2 = sqlite3.connect(mig_db)
+con2.executescript(
+    """CREATE TABLE files (
+         id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL,
+         name TEXT NOT NULL, category TEXT NOT NULL, platform TEXT NOT NULL,
+         arch TEXT NOT NULL DEFAULT 'unknown', file_type TEXT NOT NULL,
+         version TEXT NOT NULL DEFAULT '', vendor TEXT NOT NULL DEFAULT '',
+         description TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL,
+         mtime REAL NOT NULL, indexed_at REAL NOT NULL,
+         priority INTEGER NOT NULL DEFAULT 3);
+       CREATE VIRTUAL TABLE files_fts USING fts5(
+         path, name, version, description, vendor,
+         content='', tokenize='unicode61');
+       CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);""")
+con2.execute(
+    "INSERT INTO files (path, name, category, platform, file_type, "
+    "size, mtime, indexed_at, priority) VALUES "
+    "('mig.iso','mig.iso','iso','unknown','iso',?,0,0,3)",
+    (len(mig_iso_data),))
+con2.execute("INSERT INTO files_fts(rowid, path, name, version, description, "
+             "vendor) VALUES (1,'mig.iso','mig.iso','','','')")
+con2.execute("INSERT INTO meta(key, value) VALUES ('schema_version','2')")
+con2.commit()
+con2.close()
+
+mig_cfg = dict(CFG)
+mig_cfg["data_dir"] = mig_data
+mig_cfg["db_path"] = mig_db
+con3 = db.connect(mig_cfg)  # triggers ensure_schema -> _migrate
+cols = {r[1] for r in con3.execute("PRAGMA table_info(files)")}
+assert {"sha256", "md5"} <= cols, f"migration did not add columns: {cols}"
+ver = con3.execute(
+    "SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+assert str(ver) == "3", f"schema_version not advanced: {ver}"
+val = con3.execute(
+    "SELECT sha256 FROM files WHERE path='mig.iso'").fetchone()[0]
+assert val == mig_sha, \
+    f"backfilled sha256 {val[:12]}... != {mig_sha[:12]}..."
+# a second connect is a no-op (idempotent)
+con3b = db.connect(mig_cfg)
+val2 = con3b.execute(
+    "SELECT sha256 FROM files WHERE path='mig.iso'").fetchone()[0]
+assert val2 == mig_sha
+con3b.close()
+con3.close()
+shutil.rmtree(mig_data, ignore_errors=True)
+for p in (mig_db, mig_db + "-wal", mig_db + "-shm"):
+    try:
+        os.unlink(p)
+    except FileNotFoundError:
+        pass
+print("v2 -> v3: columns added, sidecars backfilled, idempotent: OK")
 
 print("\nALL OK")

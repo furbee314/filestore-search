@@ -55,7 +55,12 @@ with open(newfile, "wb") as f:
     f.write(b"z" * 4096)
 
 import subprocess
-env = dict(os.environ, FILESTORE_SEARCH_DB=os.path.join(HERE, "test-search.db"))
+# Pin the refresh to THIS test store: the shell may leak
+# FILESTORE_SEARCH_DATA/DB pointing elsewhere, which would reindex a
+# different directory than the one the app under test serves.
+env = dict(os.environ,
+           FILESTORE_SEARCH_DATA=os.path.join(HERE, "data"),
+           FILESTORE_SEARCH_DB=os.path.join(HERE, "test-search.db"))
 r = subprocess.run(["python3", "-m", "cli", "refresh"],
                    cwd=HERE, env=env,
                    capture_output=True, text=True)

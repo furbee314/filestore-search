@@ -29,7 +29,7 @@ import sqlite3
 
 from config import load_config
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -46,7 +46,9 @@ CREATE TABLE IF NOT EXISTS files (
   size INTEGER NOT NULL DEFAULT 0,
   mtime REAL NOT NULL DEFAULT 0,
   indexed_at REAL NOT NULL DEFAULT 0,
-  priority INTEGER NOT NULL DEFAULT 3
+  priority INTEGER NOT NULL DEFAULT 3,
+  sha256 TEXT NOT NULL DEFAULT '',
+  md5 TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_files_category ON files(category);
 CREATE INDEX IF NOT EXISTS idx_files_platform ON files(platform);

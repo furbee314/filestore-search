@@ -123,6 +123,9 @@ def main():
                 print(f"  [{r['category']:>13}] {r['name']}")
                 print(f"      {r['path']}  v={r['version'] or '-'}  "
                       f"arch={r['arch']}  size={r['size']}")
+                if r.get("sha256") or r.get("md5"):
+                    print(f"      sha256: {r.get('sha256') or '-'}")
+                    print(f"      md5:    {r.get('md5') or '-'}")
         return 0
 
     if args.cmd == "newest":
@@ -146,6 +149,9 @@ def main():
                 print(f"  [{r['category']:>13}] {r['name']}   modified {m}")
                 print(f"      {r['path']}  v={r['version'] or '-'}  "
                       f"arch={r['arch']}  size={r['size']}")
+                if r.get("sha256") or r.get("md5"):
+                    print(f"      sha256: {r.get('sha256') or '-'}")
+                    print(f"      md5:    {r.get('md5') or '-'}")
         return 0
 
     if args.cmd == "llm-test":

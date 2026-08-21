@@ -10,6 +10,7 @@
 
 Used for end-to-end testing of the index + search pipeline.
 """
+import hashlib
 import os
 import sys
 
@@ -98,6 +99,20 @@ def main():
             with open(full, "wb") as f:
                 # vary sizes a bit so size display isn't all zero
                 f.write(b"x" * (len(rel) * 97 % 500000 + 1024))
+        # Checksum sidecars must contain the REAL digest of the sibling
+        # file (coreutils layout: "DIGEST  filename") so the index test
+        # can verify the extracted value end-to-end.
+        if rel.endswith((".sha256", ".md5")):
+            suffix = os.path.splitext(rel)[1]
+            main_name = rel[:-len(suffix)]
+            algo = "sha256" if suffix == ".sha256" else "md5"
+            main_full = os.path.join(out, main_name)
+            h = hashlib.new(algo)
+            with open(main_full, "rb") as mf:
+                for chunk in iter(lambda: mf.read(1 << 20), b""):
+                    h.update(chunk)
+            with open(full, "w") as f:
+                f.write(h.hexdigest() + "  " + os.path.basename(main_name) + "\n")
     print(f"wrote {len(FILES)} synthetic files under {out!s}")
 
 
